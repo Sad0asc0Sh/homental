@@ -2,11 +2,24 @@
  * Homental — Initial Seed (pilot: Mashhad)
  * ============================================================================
  * Seeds:
- *   1. City (Mashhad) + central branch
- *   2. Users: super admin, branch admin, 3 technicians, 1 customer (+ wallet)
+ *   1. Branch admin → City (Mashhad) → Central branch (partner showroom, 10% commission)
+ *   2. Technicians (linked to the central branch) + demo customer (+ wallet)
  *   3. Platform configs (bundle discount, surge, urgency, escrow split, dispatch)
  *   4. Service definitions: full `uiSchema` + `pricingSchema` JSON (all copy in fa)
- *   5. Advisory rules: 6 cross-service JSON-Logic gap detectors
+ *   5. Advisory rules: 7 cross-service JSON-Logic gap detectors
+ *
+ * Execution order matters: the branch admin, City and Branch are created FIRST,
+ * then `cityId` / `branchId` are passed into the technician & customer seeders
+ * (a fresh database has no City rows — technicians must not be orphaned).
+ *
+ * JSON-Logic dialect
+ * ------------------
+ * The pricing & advisory JSON-Logic evaluator MUST support (register) the
+ * operators `ceil` and `max` (built into json-logic-js; register equivalents
+ * when using another engine). `max` is also used to clamp remote quantities:
+ * `{ max: [0, { '-': [{ var: 'remoteCount' }, 1] }] }` — remoteCount is
+ * UI-clamped at 0, so without the clamp the formula would produce −1 and
+ * SUBTRACT money from the quote.
  *
  * UI Schema grammar (homental/ui-schema/v1):
  *   steps[].fields[] — type: STEPPER | CHIPS | SWITCH
@@ -32,23 +45,22 @@
  *     locationType: LocationType,
  *     building:     { unitsCount, floorsCount, hasGuard?, ... },
  *     services: {
- *       CCTV:             { active: boolean, cameraCount, nightPlate, ... },
- *       ALARM:            { active: boolean, doorSensorCount, ... },
- *       ELECTRIC_SHUTTER: { active: boolean, upsBackup, bladeType, ... },
- *       PARKING_JACK:     { active: boolean, jackType, ... }
+ *       CCTV:             { active, cameraCount, nightPlate, colorNight, audioRecord, ... },
+ *       ALARM:            { active, doorSensorCount, petImmune, ... },
+ *       ELECTRIC_SHUTTER: { active, upsBackup, bladeType, ... },
+ *       PARKING_JACK:     { active, jackType, usagePerDay, electricLock, ... }
  *     }
  *   }
  *   (`active` = customer has saved a configuration for that service)
  */
 
+import type {
+  LocationType} from '@prisma/client';
 import {
   PrismaClient,
   UserRole,
-  UserStatus,
-  TechnicianStatus,
   ServiceKey,
   SecurityPillar,
-  LocationType,
   WalletOwnerType,
   WalletTransactionType,
   WalletTransactionStatus,
@@ -59,8 +71,12 @@ const prisma = new PrismaClient();
 // Fixed identifier for the single PLATFORM wallet (fees & warranty reserve).
 const PLATFORM_WALLET_OWNER_ID = '00000000-0000-0000-0000-000000000001';
 
+// Demo top-up — idempotent: created once, balance increments only on first run.
+const DEMO_TOPUP_IDEMPOTENCY_KEY = 'seed-customer-topup-001';
+const DEMO_TOPUP_AMOUNT_TOMAN = 50_000_000n;
+
 // ============================================================================
-// 1) CITY & BRANCH
+// 1) CITY & BRANCH (seeded FIRST — everything else references them)
 // ============================================================================
 
 const mashhad = {
@@ -71,13 +87,19 @@ const mashhad = {
   centerLng: 59.6067,
 };
 
+// Partner branch with a physical showroom → reduced commission (10% instead of
+// the 15% default in PlatformConfig['escrow.split']); warranty reserve stays
+// at the default (null => fallback).
 const centralBranch = {
   code: 'MSHD-C1',
   nameFa: 'شعبه مرکزی مشهد',
-  addressFa: 'بلوار وکیل‌آباد، نبش وکیل‌آباد ۲۵، ساختمان همنتال',
+  addressFa: 'بلوار وکیل‌آباد، نبش وکیل‌آباد ۲۵، ساختمان هومنتال',
   phone: '+989120000002',
   lat: 36.3105,
   lng: 59.5663,
+  hasPhysicalShowroom: true,
+  commissionRateOverride: 0.1,
+  warrantyReserveOverride: null as number | null,
 };
 
 // ============================================================================
@@ -144,6 +166,22 @@ const cctvUiSchema = {
           step: 1,
           default: 15,
           pricingVar: 'storageDays',
+        },
+        {
+          id: 'colorNight',
+          type: 'SWITCH',
+          labelFa: 'دید در شب رنگی',
+          descriptionFa: 'ثبت تصویر رنگی در نور کم به‌جای سیاه‌وسفید؛ شناسایی رنگ خودرو و لباس',
+          default: false,
+          pricingVar: 'colorNight',
+        },
+        {
+          id: 'audioRecord',
+          type: 'SWITCH',
+          labelFa: 'ضبط صدا',
+          descriptionFa: 'ثبت صدای محیط کنار تصویر هر دوربین',
+          default: false,
+          pricingVar: 'audioRecord',
         },
         {
           id: 'remoteView',
@@ -233,6 +271,14 @@ const alarmUiSchema = {
           default: 1,
           pricingVar: 'motionSensorCount',
         },
+        {
+          id: 'petImmune',
+          type: 'SWITCH',
+          labelFa: 'ضدحساسیت به حیوان خانگی',
+          descriptionFa: 'سنسور حرکتی هوشمند که با تکان خوردن گربه یا سگ کوچک هشدار نمی‌دهد',
+          default: false,
+          pricingVar: 'petImmune',
+        },
       ],
     },
     {
@@ -318,6 +364,7 @@ const parkingJackUiSchema = {
           options: [
             { value: 'SINGLE_ARM', labelFa: 'تک‌بازو', hintFa: 'مناسب سواری و تردد کم' },
             { value: 'DOUBLE_ARM', labelFa: 'دوبازو', hintFa: 'سنگین‌تر و مناسب تردد بالا و خودروهای بزرگ' },
+            { value: 'HYDRAULIC', labelFa: 'هیدرولیک پرتردد', hintFa: 'موتور قوی برای دهانه پهن و تردد سنگین؛ انتخاب ساختمان‌های بزرگ' },
           ],
         },
         {
@@ -358,6 +405,14 @@ const parkingJackUiSchema = {
           step: 1,
           default: 2,
           pricingVar: 'remoteCount',
+        },
+        {
+          id: 'electricLock',
+          type: 'SWITCH',
+          labelFa: 'قفل برقی ضددیلم',
+          descriptionFa: 'قفل مکانیکی برقی که باز کردن جک با دیل و هره را تقریباً غیرممکن می‌کند',
+          default: false,
+          pricingVar: 'electricLock',
         },
         {
           id: 'batteryBackup',
@@ -449,6 +504,7 @@ const electricShutterUiSchema = {
           options: [
             { value: 'ALU_STANDARD', labelFa: 'آلومینیوم استاندارد', hintFa: 'اقتصادی، برای مغازه معمولی' },
             { value: 'ALU_INSULATED', labelFa: 'فوم‌دار عایق', hintFa: 'عایق حرارت و صدای خیابان' },
+            { value: 'POLYCARBONATE', labelFa: 'پلی‌کربنات شفاف ویترینی', hintFa: 'نمایش کامل ویترین با مقاومت بالا' },
             { value: 'STEEL_HEAVY', labelFa: 'فولادی ضدسرقت', hintFa: 'پیشنهاد ما برای مغازه‌های حساس مثل طلا و موبایل' },
           ],
         },
@@ -517,6 +573,7 @@ const electricShutterUiSchema = {
 
 // ============================================================================
 // 3) SERVICE DEFINITIONS — PRICING SCHEMAS (Toman; JSON-Logic quantities)
+//    NOTE: evaluator must register `ceil` and `max` JSON-Logic operators.
 // ============================================================================
 
 const cctvPricingSchema = {
@@ -525,6 +582,8 @@ const cctvPricingSchema = {
   variables: {
     cameraCount: 4,
     nightPlate: false,
+    colorNight: false,
+    audioRecord: false,
     cameraQuality: 'STANDARD_4MP',
     storageDays: 15,
     remoteView: true,
@@ -559,6 +618,18 @@ const cctvPricingSchema = {
         unitPrice: 9800000,
       },
       {
+        ref: 'COLOR_NIGHT',
+        labelFa: 'ماژول دید در شب رنگی (هر دوربین)',
+        qty: { if: [{ var: 'colorNight' }, { var: 'cameraCount' }, 0] },
+        unitPrice: 1650000,
+      },
+      {
+        ref: 'AUDIO_MODULE',
+        labelFa: 'ماژول ضبط صدا (هر دوربین)',
+        qty: { if: [{ var: 'audioRecord' }, { var: 'cameraCount' }, 0] },
+        unitPrice: 850000,
+      },
+      {
         ref: 'CABLE_KIT',
         labelFa: 'کابل، کانکتور و متعلقات نصب',
         qty: 1,
@@ -567,7 +638,7 @@ const cctvPricingSchema = {
     ],
   },
   labor: {
-    base: { labelFa: 'اجر نصب و راه‌اندازی پایه', amount: 450000 },
+    base: { labelFa: 'اجرت نصب و راه‌اندازی پایه', amount: 450000 },
     perUnit: [
       {
         labelFa: 'نصب و کابل‌کشی هر دوربین',
@@ -601,6 +672,7 @@ const alarmPricingSchema = {
     doorSensorCount: 2,
     windowSensorCount: 2,
     motionSensorCount: 1,
+    petImmune: false,
     sirenType: 'INDOOR_OUTDOOR',
     gsmModule: true,
     panicButton: false,
@@ -624,7 +696,8 @@ const alarmPricingSchema = {
         ref: 'MOTION_SENSOR',
         labelFa: 'سنسور تشخیص حرکت',
         qty: { var: 'motionSensorCount' },
-        unitPrice: 1250000,
+        // Pet-immune sensors cost more than standard PIR sensors
+        unitPriceLogic: { if: [{ var: 'petImmune' }, 1850000, 1250000] },
       },
       {
         ref: 'SIREN_OUT',
@@ -647,7 +720,7 @@ const alarmPricingSchema = {
     ],
   },
   labor: {
-    base: { labelFa: 'اجر نصب، برنامه‌ریزی ساعتی و تست کامل سیستم', amount: 650000 },
+    base: { labelFa: 'اجرت نصب، برنامه‌ریزی ساعتی و تست کامل سیستم', amount: 650000 },
     perUnit: [
       {
         labelFa: 'نصب و راه‌اندازی هر سنسور',
@@ -673,6 +746,7 @@ const parkingJackPricingSchema = {
     openingWidthCm: 400,
     usagePerDay: 10,
     remoteCount: 2,
+    electricLock: false,
     batteryBackup: true,
     safetyEdge: false,
   },
@@ -684,7 +758,7 @@ const parkingJackPricingSchema = {
         qty: 1,
         unitPriceByOption: {
           variable: 'jackType',
-          options: { SINGLE_ARM: 46000000, DOUBLE_ARM: 79000000 },
+          options: { SINGLE_ARM: 46000000, DOUBLE_ARM: 79000000, HYDRAULIC: 118000000 },
         },
       },
       {
@@ -692,6 +766,12 @@ const parkingJackPricingSchema = {
         labelFa: 'قاب و سازه نصب (هر متر عرض)',
         qty: { ceil: { '/': [{ var: 'openingWidthCm' }, 100] } },
         unitPrice: 3200000,
+      },
+      {
+        ref: 'ELECTRIC_LOCK',
+        labelFa: 'قفل برقی ضددیلم',
+        qty: { if: [{ var: 'electricLock' }, 1, 0] },
+        unitPrice: 6500000,
       },
       {
         ref: 'BATTERY',
@@ -708,19 +788,31 @@ const parkingJackPricingSchema = {
       {
         ref: 'REMOTE',
         labelFa: 'ریموت اضافه (اولین ریموت همراه جک است)',
-        qty: { '-': [{ var: 'remoteCount' }, 1] },
+        // remoteCount >= 1 for the jack, but clamp at 0 anyway for safety:
+        // never let a quantity go negative and SUBTRACT from hardware cost.
+        qty: { max: [0, { '-': [{ var: 'remoteCount' }, 1] }] },
         unitPrice: 900000,
       },
     ],
   },
   labor: {
-    base: { labelFa: 'اجر نصب مکانیکی و برق‌کاری', amount: 3500000 },
+    base: { labelFa: 'اجرت نصب مکانیکی و برق‌کاری', amount: 3500000 },
     perUnit: [],
     complexity: [
       {
         labelFa: 'نصب سنگین نوع دوبازو',
         multiplier: 1.2,
         when: { '==': [{ var: 'jackType' }, 'DOUBLE_ARM'] },
+      },
+      {
+        labelFa: 'نصب جک هیدرولیک پرتردد',
+        multiplier: 1.3,
+        when: { '==': [{ var: 'jackType' }, 'HYDRAULIC'] },
+      },
+      {
+        labelFa: 'نصب و هم‌زمان‌سازی قفل برقی ضددیلم',
+        multiplier: 1.05,
+        when: { var: 'electricLock' },
       },
       {
         labelFa: 'تردد بالا (بیش از ۳۰ بار در روز)',
@@ -779,7 +871,12 @@ const electricShutterPricingSchema = {
         },
         unitPriceByOption: {
           variable: 'bladeType',
-          options: { ALU_STANDARD: 2600000, ALU_INSULATED: 3600000, STEEL_HEAVY: 5800000 },
+          options: {
+            ALU_STANDARD: 2600000,
+            ALU_INSULATED: 3600000,
+            POLYCARBONATE: 4400000,
+            STEEL_HEAVY: 5800000,
+          },
         },
       },
       {
@@ -797,13 +894,15 @@ const electricShutterPricingSchema = {
       {
         ref: 'REMOTE',
         labelFa: 'ریموت اضافه (اولین ریموت همراه موتور است)',
-        qty: { '-': [{ var: 'remoteCount' }, 1] },
+        // remoteCount can be 0 (customer uses smart control only) — clamp at 0
+        // so the quote is never REDUCED by a negative quantity.
+        qty: { max: [0, { '-': [{ var: 'remoteCount' }, 1] }] },
         unitPrice: 1150000,
       },
     ],
   },
   labor: {
-    base: { labelFa: 'اجر نصب موتور، پره و راه‌اندازی', amount: 2800000 },
+    base: { labelFa: 'اجرت نصب موتور، پره و راه‌اندازی', amount: 2800000 },
     perUnit: [],
     complexity: [
       {
@@ -878,7 +977,7 @@ const serviceDefinitions = [
     titleFa: 'جک پارکینگی',
     subtitleFa: 'مانع فیزیکی مطمئن جلوی خودرو، حتی در نبود نگهبان',
     descriptionFa:
-      'جک پارکینگی تک‌بازو یا دوبازو با ریموت و امکان باتری پشتیبان؛ سد فیزیکی مطمئن برای پارکینگ منزل، ساختمان یا انبار.',
+      'جک پارکینگی تک‌بازو، دوبازو یا هیدرولیک پرتردد با ریموت، قفل برقی ضددیلم و باتری پشتیبان؛ سد فیزیکی مطمئن برای پارکینگ منزل، ساختمان یا انبار.',
     iconKey: 'parking-jack',
     displayOrder: 3,
     supportedLocationTypes: allLocationTypes,
@@ -894,7 +993,7 @@ const serviceDefinitions = [
     titleFa: 'کرکره برقی',
     subtitleFa: 'سد امنیتی و مرتب برای ویترین و درب مغازه',
     descriptionFa:
-      'کرکره برقی با پره آلومینیوم، فوم‌دار یا فولادی ضدسرقت؛ با موتور متناسب با متراژ دهانه، UPS پشتیبان و کنترل هوشمند.',
+      'کرکره برقی با پره آلومینیوم، فوم‌دار، پلی‌کربنات شفاف ویترینی یا فولادی ضدسرقت؛ با موتور متناسب با متراژ دهانه، UPS پشتیبان و کنترل هوشمند.',
     iconKey: 'electric-shutter',
     displayOrder: 4,
     supportedLocationTypes: allLocationTypes,
@@ -908,6 +1007,7 @@ const serviceDefinitions = [
 
 // ============================================================================
 // 4) ADVISORY RULES — cross-service gap detection (JSON-Logic)
+//    Selected suggestions: sorted by priority ASC, max 2 returned per profile.
 // ============================================================================
 
 const advisoryRules = [
@@ -930,6 +1030,47 @@ const advisoryRules = [
     scoreImpact: { intrusion: 30 },
   },
   {
+    code: 'SHOP_SENSITIVE_SHUTTER_NO_UPS_HEAVY',
+    pillar: SecurityPillar.PHYSICAL,
+    priority: 15,
+    appliesToLocationTypes: ['SHOP'] as LocationType[],
+    condition: {
+      and: [
+        { '==': [{ var: 'locationType' }, 'SHOP'] },
+        { '==': [{ var: 'services.ELECTRIC_SHUTTER.active' }, true] },
+        {
+          or: [
+            { '==': [{ var: 'services.ELECTRIC_SHUTTER.upsBackup' }, false] },
+            { '!=': [{ var: 'services.ELECTRIC_SHUTTER.bladeType' }, 'STEEL_HEAVY'] },
+          ],
+        },
+      ],
+    },
+    suggestedActionFa:
+      'کرکره بدون UPS در قطع برق از کار می‌افتد و پره آلومینیومی معمولی با دیل و هره باز می‌شود. برای مغازه حساس، اضافه کردن UPS و ارتقای پره به فولادی ضدسرقت پیشنهاد می‌شود.',
+    suggestedServiceKey: ServiceKey.ELECTRIC_SHUTTER,
+    suggestedConfig: { upsBackup: true, bladeType: 'STEEL_HEAVY' },
+    scoreImpact: { physical: 15 },
+  },
+  {
+    code: 'WAREHOUSE_ALARM_NO_CCTV',
+    pillar: SecurityPillar.MONITORING,
+    priority: 15,
+    appliesToLocationTypes: ['WAREHOUSE'] as LocationType[],
+    condition: {
+      and: [
+        { '==': [{ var: 'locationType' }, 'WAREHOUSE'] },
+        { '==': [{ var: 'services.ALARM.active' }, true] },
+        { '!=': [{ var: 'services.CCTV.active' }, true] },
+      ],
+    },
+    suggestedActionFa:
+      'دزدگیر بدون دوربین یعنی هشدار بدون سند؛ در انبار باید بتوانی علت هشدار را از راه دور ببینی. پکیج دوربین با ضبط ۳۰ روزه برای ورودی و راهروهای اصلی پیشنهاد می‌شود.',
+    suggestedServiceKey: ServiceKey.CCTV,
+    suggestedConfig: { cameraCount: 4, storageDays: 30 },
+    scoreImpact: { monitoring: 30 },
+  },
+  {
     code: 'PARKING_CCTV_NO_PLATE_NIGHT',
     pillar: SecurityPillar.MONITORING,
     priority: 20,
@@ -949,45 +1090,32 @@ const advisoryRules = [
     scoreImpact: { monitoring: 15 },
   },
   {
-    code: 'APARTMENT_HIGH_UNITS_NO_PARKING_JACK',
+    code: 'HIGH_TRAFFIC_PARKING_JACK_UPGRADE',
     pillar: SecurityPillar.PHYSICAL,
-    priority: 30,
-    appliesToLocationTypes: ['APARTMENT'] as LocationType[],
+    priority: 22,
+    appliesToLocationTypes: ['APARTMENT', 'PARKING', 'WAREHOUSE'] as LocationType[],
     condition: {
       and: [
-        { '==': [{ var: 'locationType' }, 'APARTMENT'] },
-        { '>=': [{ var: 'building.unitsCount' }, 8] },
-        { '!=': [{ var: 'services.PARKING_JACK.active' }, true] },
-      ],
-    },
-    suggestedActionFa:
-      'در ساختمان‌های پرجمعیت، پارکینگ مشترک معمولاً بی‌حفاظ است و تردد غریبه‌ها بالا می‌رود. نصب جک پارکینگی دوبازو روی دهانه مشترک پیشنهاد می‌شود.',
-    suggestedServiceKey: ServiceKey.PARKING_JACK,
-    suggestedConfig: { jackType: 'DOUBLE_ARM' },
-    scoreImpact: { physical: 20 },
-  },
-  {
-    code: 'SHOP_SENSITIVE_SHUTTER_NO_UPS_HEAVY',
-    pillar: SecurityPillar.PHYSICAL,
-    priority: 15,
-    appliesToLocationTypes: ['SHOP'] as LocationType[],
-    condition: {
-      and: [
-        { '==': [{ var: 'locationType' }, 'SHOP'] },
-        { '==': [{ var: 'services.ELECTRIC_SHUTTER.active' }, true] },
+        { '==': [{ var: 'services.PARKING_JACK.active' }, true] },
         {
           or: [
-            { '==': [{ var: 'services.ELECTRIC_SHUTTER.upsBackup' }, false] },
-            { '!=': [{ var: 'services.ELECTRIC_SHUTTER.bladeType' }, 'STEEL_HEAVY'] },
+            { '>=': [{ var: 'building.unitsCount' }, 15] },
+            { '>': [{ var: 'services.PARKING_JACK.usagePerDay' }, 30] },
+          ],
+        },
+        {
+          or: [
+            { '!=': [{ var: 'services.PARKING_JACK.jackType' }, 'HYDRAULIC'] },
+            { '!=': [{ var: 'services.PARKING_JACK.electricLock' }, true] },
           ],
         },
       ],
     },
     suggestedActionFa:
-      'کرکره بدون UPS در قطع برق از کار می‌افتد و پره آلومینیومی معمولی با هره‌برداری ساده باز می‌شود. برای مغازه حساس، اضافه کردن UPS و ارتقای پره به فولادی ضدسرقت پیشنهاد می‌شود.',
-    suggestedServiceKey: ServiceKey.ELECTRIC_SHUTTER,
-    suggestedConfig: { upsBackup: true, bladeType: 'STEEL_HEAVY' },
-    scoreImpact: { physical: 15 },
+      'با این حجم از تردد، جک معمولی به‌سرعت فرسوده می‌شود و قفل مکانیکی ساده جلوی دیل و هره را نمی‌گیرد. ارتقا به جک هیدرولیک پرتردد به‌همراه قفل برقی ضددیلم پیشنهاد می‌شود.',
+    suggestedServiceKey: ServiceKey.PARKING_JACK,
+    suggestedConfig: { jackType: 'HYDRAULIC', electricLock: true },
+    scoreImpact: { physical: 20 },
   },
   {
     code: 'VILLA_NO_CCTV',
@@ -1007,22 +1135,22 @@ const advisoryRules = [
     scoreImpact: { monitoring: 30 },
   },
   {
-    code: 'WAREHOUSE_ALARM_NO_CCTV',
-    pillar: SecurityPillar.MONITORING,
-    priority: 15,
-    appliesToLocationTypes: ['WAREHOUSE'] as LocationType[],
+    code: 'APARTMENT_HIGH_UNITS_NO_PARKING_JACK',
+    pillar: SecurityPillar.PHYSICAL,
+    priority: 30,
+    appliesToLocationTypes: ['APARTMENT'] as LocationType[],
     condition: {
       and: [
-        { '==': [{ var: 'locationType' }, 'WAREHOUSE'] },
-        { '==': [{ var: 'services.ALARM.active' }, true] },
-        { '!=': [{ var: 'services.CCTV.active' }, true] },
+        { '==': [{ var: 'locationType' }, 'APARTMENT'] },
+        { '>=': [{ var: 'building.unitsCount' }, 8] },
+        { '!=': [{ var: 'services.PARKING_JACK.active' }, true] },
       ],
     },
     suggestedActionFa:
-      'دزدگیر بدون دوربین یعنی هشدار بدون سند؛ در انبار باید بتوانی علت هشدار را از راه دور ببینی. پکیج دوربین با ضبط ۳۰ روزه برای ورودی و راهروهای اصلی پیشنهاد می‌شود.',
-    suggestedServiceKey: ServiceKey.CCTV,
-    suggestedConfig: { cameraCount: 4, storageDays: 30 },
-    scoreImpact: { monitoring: 30 },
+      'در ساختمان‌های پرجمعیت، پارکینگ مشترک معمولاً بی‌حفاظ است و تردد غریبه‌ها بالا می‌رود. نصب جک پارکینگی دوبازو روی دهانه مشترک پیشنهاد می‌شود.',
+    suggestedServiceKey: ServiceKey.PARKING_JACK,
+    suggestedConfig: { jackType: 'DOUBLE_ARM' },
+    scoreImpact: { physical: 20 },
   },
 ];
 
@@ -1043,16 +1171,16 @@ const platformConfigs = [
   {
     key: 'pricing.urgency',
     value: {
-      // applies to labor + dispatch only — never hardware
-      multipliers: { SCHEDULED: 1.0, SAME_DAY: 1.25, EMERGENCY: 1.6 },
+      // applies to labor + dispatch ONLY — never hardware
+      multipliers: { SCHEDULED: 1.0, SAME_DAY: 1.12, EMERGENCY: 1.3 },
     },
   },
   {
     key: 'pricing.surge',
     value: {
-      // supply/demand ratio = online skilled technicians / pending orders in Redis GEO zone
+      // supply/demand ratio = online skilled technicians / pending orders in the Redis GEO zone
       minMultiplier: 1.0,
-      maxMultiplier: 1.8,
+      maxMultiplier: 1.25, // trust cap — Homental never surges above 25%
       balancedRatio: 1.0, // ratio >= this => no surge
       scarceRatio: 0.4, // ratio <= this => max surge
     },
@@ -1060,7 +1188,7 @@ const platformConfigs = [
   {
     key: 'escrow.split',
     value: {
-      platformCommissionRate: 0.15,
+      platformCommissionRate: 0.15, // default; Branch.commissionRateOverride wins when set
       warrantyReserveRate: 0.05, // dedicated ledger, released to technician after warranty ends
     },
   },
@@ -1087,10 +1215,37 @@ const platformConfigs = [
 // SEED RUNNER
 // ============================================================================
 
-async function seedCityAndBranch(adminId: string): Promise<string> {
+interface UpsertUserInput {
+  phone: string;
+  role: UserRole;
+  firstName: string;
+  lastName: string;
+}
+
+function upsertUser(data: UpsertUserInput) {
+  return prisma.user.upsert({
+    where: { phone: data.phone },
+    update: { role: data.role, firstName: data.firstName, lastName: data.lastName },
+    create: { ...data, status: 'ACTIVE' },
+  });
+}
+
+/** Creates branch admin → City → Branch (partner showroom, 10% commission). */
+async function seedCityAndBranch(): Promise<{ cityId: string; branchId: string }> {
+  const branchAdmin = await upsertUser({
+    phone: '+989120000002',
+    role: UserRole.BRANCH_ADMIN,
+    firstName: 'حسین',
+    lastName: 'رضایی',
+  });
+
   const city = await prisma.city.upsert({
     where: { slug: mashhad.slug },
-    update: { nameFa: mashhad.nameFa, centerLat: mashhad.centerLat, centerLng: mashhad.centerLng },
+    update: {
+      nameFa: mashhad.nameFa,
+      centerLat: mashhad.centerLat,
+      centerLng: mashhad.centerLng,
+    },
     create: {
       slug: mashhad.slug,
       nameFa: mashhad.nameFa,
@@ -1102,99 +1257,112 @@ async function seedCityAndBranch(adminId: string): Promise<string> {
 
   const branch = await prisma.branch.upsert({
     where: { code: centralBranch.code },
-    update: { adminId, nameFa: centralBranch.nameFa },
+    update: {
+      adminId: branchAdmin.id,
+      nameFa: centralBranch.nameFa,
+      hasPhysicalShowroom: centralBranch.hasPhysicalShowroom,
+      commissionRateOverride: centralBranch.commissionRateOverride,
+      warrantyReserveOverride: centralBranch.warrantyReserveOverride,
+    },
     create: {
       code: centralBranch.code,
       cityId: city.id,
-      adminId,
+      adminId: branchAdmin.id,
       nameFa: centralBranch.nameFa,
       addressFa: centralBranch.addressFa,
       phone: centralBranch.phone,
       lat: centralBranch.lat,
       lng: centralBranch.lng,
+      hasPhysicalShowroom: centralBranch.hasPhysicalShowroom,
+      commissionRateOverride: centralBranch.commissionRateOverride,
+      warrantyReserveOverride: centralBranch.warrantyReserveOverride,
     },
   });
 
   await prisma.wallet.upsert({
-    where: { ownerType_ownerId: { ownerType: 'BRANCH', ownerId: branch.id } },
+    where: { ownerType_ownerId: { ownerType: WalletOwnerType.BRANCH, ownerId: branch.id } },
     update: {},
-    create: { ownerType: 'BRANCH', ownerId: branch.id, branchId: branch.id },
+    create: {
+      ownerType: WalletOwnerType.BRANCH,
+      ownerId: branch.id,
+      branchId: branch.id,
+    },
   });
 
-  return branch.id;
+  return { cityId: city.id, branchId: branch.id };
 }
 
-async function upsertUser(data: {
+interface TechnicianSeed {
   phone: string;
-  role: UserRole;
   firstName: string;
   lastName: string;
-}) {
-  return prisma.user.upsert({
-    where: { phone: data.phone },
-    update: { role: data.role, firstName: data.firstName, lastName: data.lastName },
-    create: { ...data, status: 'ACTIVE' },
-  });
+  skills: ServiceKey[];
+  rating: number;
+  ratingCount: number;
+  completedJobs: number;
+  warrantyClaimRate: number;
+  lat: number;
+  lng: number;
 }
 
-async function seedUsers() {
-  await upsertUser({
+const technicianSeeds: TechnicianSeed[] = [
+  {
+    phone: '+989120000010',
+    firstName: 'امیر',
+    lastName: 'کریمی',
+    skills: [ServiceKey.CCTV, ServiceKey.ALARM],
+    rating: 4.8,
+    ratingCount: 126,
+    completedJobs: 143,
+    warrantyClaimRate: 0.02,
+    lat: 36.3121,
+    lng: 59.5679,
+  },
+  {
+    phone: '+989120000011',
+    firstName: 'رضا',
+    lastName: 'احمدی',
+    skills: [ServiceKey.ELECTRIC_SHUTTER, ServiceKey.PARKING_JACK],
+    rating: 4.6,
+    ratingCount: 89,
+    completedJobs: 97,
+    warrantyClaimRate: 0.03,
+    lat: 36.3052,
+    lng: 59.5741,
+  },
+  {
+    phone: '+989120000012',
+    firstName: 'مهدی',
+    lastName: 'نوری',
+    skills: [
+      ServiceKey.CCTV,
+      ServiceKey.ALARM,
+      ServiceKey.ELECTRIC_SHUTTER,
+      ServiceKey.PARKING_JACK,
+    ],
+    rating: 4.9,
+    ratingCount: 210,
+    completedJobs: 233,
+    warrantyClaimRate: 0.01,
+    lat: 36.3098,
+    lng: 59.5612,
+  },
+];
+
+/** All technicians belong to the Mashhad central branch — never orphaned. */
+async function seedTechnicians(branchId: string): Promise<void> {
+  const superAdmin = await upsertUser({
     phone: '+989120000001',
-    role: 'SUPER_ADMIN',
+    role: UserRole.SUPER_ADMIN,
     firstName: 'مدیر',
     lastName: 'سامانه',
   });
+  void superAdmin; // seeded for completeness; no profile needed
 
-  const branchAdmin = await upsertUser({
-    phone: '+989120000002',
-    role: 'BRANCH_ADMIN',
-    firstName: 'حسین',
-    lastName: 'رضایی',
-  });
-
-  const technicians = [
-    {
-      phone: '+989120000010',
-      firstName: 'امیر',
-      lastName: 'کریمی',
-      skills: ['CCTV', 'ALARM'] as ServiceKey[],
-      rating: 4.8,
-      ratingCount: 126,
-      completedJobs: 143,
-      warrantyClaimRate: 0.02,
-      lat: 36.3121,
-      lng: 59.5679,
-    },
-    {
-      phone: '+989120000011',
-      firstName: 'رضا',
-      lastName: 'احمدی',
-      skills: ['ELECTRIC_SHUTTER', 'PARKING_JACK'] as ServiceKey[],
-      rating: 4.6,
-      ratingCount: 89,
-      completedJobs: 97,
-      warrantyClaimRate: 0.03,
-      lat: 36.3052,
-      lng: 59.5741,
-    },
-    {
-      phone: '+989120000012',
-      firstName: 'مهدی',
-      lastName: 'نوری',
-      skills: ['CCTV', 'ALARM', 'ELECTRIC_SHUTTER', 'PARKING_JACK'] as ServiceKey[],
-      rating: 4.9,
-      ratingCount: 210,
-      completedJobs: 233,
-      warrantyClaimRate: 0.01,
-      lat: 36.3098,
-      lng: 59.5612,
-    },
-  ];
-
-  for (const t of technicians) {
+  for (const t of technicianSeeds) {
     const user = await upsertUser({
       phone: t.phone,
-      role: 'TECHNICIAN',
+      role: UserRole.TECHNICIAN,
       firstName: t.firstName,
       lastName: t.lastName,
     });
@@ -1202,6 +1370,7 @@ async function seedUsers() {
     await prisma.technicianProfile.upsert({
       where: { userId: user.id },
       update: {
+        branchId,
         skills: t.skills,
         rating: t.rating,
         ratingCount: t.ratingCount,
@@ -1210,6 +1379,7 @@ async function seedUsers() {
       },
       create: {
         userId: user.id,
+        branchId,
         status: 'APPROVED',
         skills: t.skills,
         rating: t.rating,
@@ -1224,15 +1394,17 @@ async function seedUsers() {
     });
 
     await prisma.wallet.upsert({
-      where: { ownerType_ownerId: { ownerType: 'TECHNICIAN', ownerId: user.id } },
+      where: { ownerType_ownerId: { ownerType: WalletOwnerType.TECHNICIAN, ownerId: user.id } },
       update: {},
-      create: { ownerType: 'TECHNICIAN', ownerId: user.id },
+      create: { ownerType: WalletOwnerType.TECHNICIAN, ownerId: user.id },
     });
   }
+}
 
+async function seedCustomerAndAddress(cityId: string): Promise<void> {
   const customer = await upsertUser({
     phone: '+989120000020',
-    role: 'CUSTOMER',
+    role: UserRole.CUSTOMER,
     firstName: 'سارا',
     lastName: 'محمدی',
   });
@@ -1244,38 +1416,44 @@ async function seedUsers() {
   });
 
   const wallet = await prisma.wallet.upsert({
-    where: { ownerType_ownerId: { ownerType: 'CUSTOMER', ownerId: customer.id } },
+    where: { ownerType_ownerId: { ownerType: WalletOwnerType.CUSTOMER, ownerId: customer.id } },
     update: {},
-    create: { ownerType: 'CUSTOMER', ownerId: customer.id },
+    create: { ownerType: WalletOwnerType.CUSTOMER, ownerId: customer.id },
   });
 
-  // Demo top-up so escrow flow is testable from day one (idempotent)
-  await prisma.walletTransaction.upsert({
-    where: { idempotencyKey: 'seed-customer-topup-001' },
-    update: {},
-    create: {
-      walletId: wallet.id,
-      type: 'TOPUP',
-      status: 'SETTLED',
-      amount: 50000000n,
-      balanceAfter: 50000000n,
-      description: 'شارژ کیف پول اولیه (داده آزمایشی)',
-      idempotencyKey: 'seed-customer-topup-001',
-    },
-  });
-  await prisma.wallet.update({
-    where: { id: wallet.id },
-    data: { balance: 50000000n },
+  // Idempotent demo top-up: if the transaction already exists (previous seed
+  // run), the customer may have spent part of the balance — NEVER reset it.
+  // Increment happens only on the very first run, inside one atomic transaction.
+  await prisma.$transaction(async (tx) => {
+    const alreadyToppedUp = await tx.walletTransaction.findUnique({
+      where: { idempotencyKey: DEMO_TOPUP_IDEMPOTENCY_KEY },
+    });
+    if (alreadyToppedUp) return;
+
+    await tx.walletTransaction.create({
+      data: {
+        walletId: wallet.id,
+        type: WalletTransactionType.TOPUP,
+        status: WalletTransactionStatus.SETTLED,
+        amount: DEMO_TOPUP_AMOUNT_TOMAN,
+        balanceAfter: DEMO_TOPUP_AMOUNT_TOMAN,
+        description: 'شارژ کیف پول اولیه (داده آزمایشی)',
+        idempotencyKey: DEMO_TOPUP_IDEMPOTENCY_KEY,
+      },
+    });
+    await tx.wallet.update({
+      where: { id: wallet.id },
+      data: { balance: { increment: DEMO_TOPUP_AMOUNT_TOMAN } },
+    });
   });
 
-  const city = await prisma.city.findUniqueOrThrow({ where: { slug: mashhad.slug } });
   await prisma.address.upsert({
     where: { id: '00000000-0000-0000-0000-000000000010' },
-    update: {},
+    update: { cityId },
     create: {
       id: '00000000-0000-0000-0000-000000000010',
       customerId: profile.id,
-      cityId: city.id,
+      cityId,
       titleFa: 'خانه',
       locationType: 'APARTMENT',
       fullAddressFa: 'مشهد، بلوار وکیل‌آباد، خیابان مهدی، پلاک ۱۲، واحد ۳',
@@ -1284,11 +1462,9 @@ async function seedUsers() {
       isDefault: true,
     },
   });
-
-  return branchAdmin.id;
 }
 
-async function seedPlatformConfigs() {
+async function seedPlatformConfigs(): Promise<void> {
   for (const cfg of platformConfigs) {
     await prisma.platformConfig.upsert({
       where: { key: cfg.key },
@@ -1300,14 +1476,14 @@ async function seedPlatformConfigs() {
   // PLATFORM wallet (fees + warranty reserve ledger) — fixed owner id
   await prisma.wallet.upsert({
     where: {
-      ownerType_ownerId: { ownerType: 'PLATFORM', ownerId: PLATFORM_WALLET_OWNER_ID },
+      ownerType_ownerId: { ownerType: WalletOwnerType.PLATFORM, ownerId: PLATFORM_WALLET_OWNER_ID },
     },
     update: {},
-    create: { ownerType: 'PLATFORM', ownerId: PLATFORM_WALLET_OWNER_ID },
+    create: { ownerType: WalletOwnerType.PLATFORM, ownerId: PLATFORM_WALLET_OWNER_ID },
   });
 }
 
-async function seedServiceDefinitions() {
+async function seedServiceDefinitions(): Promise<void> {
   for (const def of serviceDefinitions) {
     await prisma.serviceDefinition.upsert({
       where: { key: def.key },
@@ -1338,13 +1514,15 @@ async function seedServiceDefinitions() {
   }
 }
 
-async function seedAdvisoryRules() {
+async function seedAdvisoryRules(): Promise<void> {
   for (const rule of advisoryRules) {
     await prisma.advisoryRule.upsert({
       where: { code: rule.code },
       update: {
+        priority: rule.priority,
         condition: rule.condition,
         suggestedActionFa: rule.suggestedActionFa,
+        suggestedConfig: rule.suggestedConfig,
         scoreImpact: rule.scoreImpact,
         appliesToLocationTypes: rule.appliesToLocationTypes,
       },
@@ -1366,17 +1544,23 @@ async function seedAdvisoryRules() {
 async function main() {
   console.log('🌱 Seeding Homental (pilot: Mashhad)...');
 
-  const branchAdminId = await seedUsers();
-  await seedCityAndBranch(branchAdminId);
+  // 1) Branch admin → City → Branch (MUST run first on a fresh database)
+  const { cityId, branchId } = await seedCityAndBranch();
+
+  // 2) Users (technicians receive branchId — no orphans)
+  await seedTechnicians(branchId);
+  await seedCustomerAndAddress(cityId);
+
+  // 3) Configs, catalog and rules
   await seedPlatformConfigs();
   await seedServiceDefinitions();
   await seedAdvisoryRules();
 
   console.log('✅ Seed complete:');
-  console.log('   • 1 city (Mashhad) + 1 central branch + wallets');
-  console.log('   • 6 users (super admin, branch admin, 3 technicians, 1 customer)');
+  console.log('   • 1 city (Mashhad) + 1 central branch (showroom, 10% commission) + wallets');
+  console.log('   • 6 users (super admin, branch admin, 3 technicians with branch, 1 customer)');
   console.log('   • 4 service definitions with full fa uiSchema + pricingSchema');
-  console.log('   • 6 advisory rules (JSON-Logic)');
+  console.log('   • 7 advisory rules (JSON-Logic)');
   console.log('   • 5 platform configs (pricing, escrow, dispatch)');
 }
 

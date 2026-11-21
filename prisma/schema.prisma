@@ -301,6 +301,11 @@ model Branch {
   /// PostGIS point — kept in sync by the application; GIST-indexed via migration.
   location            Unsupported("geography(Point,4326)")?
   serviceRadiusMeters Int     @default(15000)
+  /// Dual-commission model: partner branches with a physical showroom can run
+  /// reduced rates; `null` falls back to PlatformConfig['escrow.split'].
+  hasPhysicalShowroom     Boolean  @default(false)
+  commissionRateOverride  Decimal? @db.Decimal(5, 4) // null => platformCommissionRate
+  warrantyReserveOverride Decimal? @db.Decimal(5, 4) // null => warrantyReserveRate
   isActive            Boolean @default(true)
   technicians         TechnicianProfile[]
   wallet              Wallet?
@@ -323,6 +328,9 @@ model Address {
   postalCode    String?
   lat           Decimal         @db.Decimal(9, 6)
   lng           Decimal         @db.Decimal(10, 6)
+  /// PostGIS mirror of lat/lng — kept in sync by BEFORE INSERT OR UPDATE
+  /// trigger (see migration footer note at the bottom of this file).
+  location      Unsupported("geography(Point,4326)")?
   isDefault     Boolean         @default(false)
   securityProfiles SecurityProfile[]
   orders        ServiceOrder[]
@@ -500,6 +508,11 @@ model ServiceOrder {
   securityProfile       SecurityProfile? @relation(fields: [securityProfileId], references: [id], onDelete: SetNull)
   addressId             String         @db.Uuid
   address               Address        @relation(fields: [addressId], references: [id])
+  /// Job-site snapshot at order creation; feeds Redis GEO zone matching.
+  /// PostGIS mirror kept in sync by BEFORE INSERT OR UPDATE trigger (see footer).
+  lat                   Decimal?       @db.Decimal(9, 6)
+  lng                   Decimal?       @db.Decimal(10, 6)
+  location              Unsupported("geography(Point,4326)")?
   state                 OrderState     @default(DRAFT)
   locationType          LocationType // denormalized snapshot from Address at creation time
   urgency               UrgencyLevel   @default(SCHEDULED)
@@ -543,6 +556,10 @@ model OrderItem {
   serviceDefinitionId String            @db.Uuid
   serviceDefinition   ServiceDefinition @relation(fields: [serviceDefinitionId], references: [id])
   config              Json // customer answers against uiSchema of that version
+  /// Per-item supply mode; `null` inherits ServiceOrder.supplyMode — lets a
+  /// customer mix INSTALL_ONLY (e.g. own CCTV) + FULL_PACKAGE (new ALARM)
+  /// within a single bundle order.
+  supplyMode          SupplyMode?
   pricingSnapshot     Json? // per-item hardware/labor lines at estimate time
   hardwareUnits       HardwareUnit[]
   createdAt           DateTime          @default(now())
@@ -568,8 +585,12 @@ model DispatchOffer {
   distanceMeters  Int? // from Redis GEO at offer time
   score           Decimal              @db.Decimal(5, 2) // weighted total, 0–100
   scoreBreakdown  Json // { proximity, skillMatch, rating, warrantyClaimRate } contributions
-  /// Redis lock key: dispatch:offer:{orderId}:{offerId} — SET NX PX 30000
-  lockKey         String               @unique
+  /// Reference to the per-order atomic Redis lock held while this offer was
+  /// live: `dispatch:order:lock:{orderId}` (SET key token NX PX ttlMs).
+  /// ONE lock per order — two technicians holding parallel offers for the
+  /// same order can never both acquire it. Release uses a token-scoped Lua
+  /// compare-and-delete, so a holder can never release someone else's lock.
+  orderLockKey    String
   offeredAt       DateTime             @default(now())
   expiresAt       DateTime // offeredAt + 30s (config: dispatch.offer.ttlSeconds)
   respondedAt     DateTime?
@@ -670,12 +691,44 @@ model Review {
 }
 
 // ============================================================================
-// POST-MIGRATION SQL (apply manually in the first migration, after `prisma migrate dev`):
+// POST-MIGRATION SQL — MUST be appended verbatim to the first migration file
+// (Prisma cannot author triggers, GIST or GIN indexes natively).
 //
-//   -- GIST indexes for geo columns (Prisma cannot create these natively)
-//   CREATE INDEX IF NOT EXISTS branches_location_gist ON "Branch" USING GIST ("location");
-//   CREATE INDEX IF NOT EXISTS technicians_location_gist ON "TechnicianProfile" USING GIST ("location");
+// -- Geo sync: keep `location` in sync from lat/lng pairs (Branch/Address/ServiceOrder)
+// CREATE OR REPLACE FUNCTION homental_sync_location() RETURNS trigger AS $$
+// BEGIN
+//   IF NEW."lat" IS NOT NULL AND NEW."lng" IS NOT NULL THEN
+//     NEW."location" := ST_SetSRID(ST_MakePoint(NEW."lng", NEW."lat"), 4326)::geography;
+//   ELSE
+//     NEW."location" := NULL;
+//   END IF;
+//   RETURN NEW;
+// END;
+// $$ LANGUAGE plpgsql;
 //
-//   -- GIN index for skill-array matching in dispatch queries
-//   CREATE INDEX IF NOT EXISTS technicians_skills_gin ON "TechnicianProfile" USING GIN ("skills");
+// -- Geo sync: TechnicianProfile uses lastKnownLat/lastKnownLng (nullable)
+// CREATE OR REPLACE FUNCTION homental_sync_technician_location() RETURNS trigger AS $$
+// BEGIN
+//   IF NEW."lastKnownLat" IS NOT NULL AND NEW."lastKnownLng" IS NOT NULL THEN
+//     NEW."location" := ST_SetSRID(ST_MakePoint(NEW."lastKnownLng", NEW."lastKnownLat"), 4326)::geography;
+//   ELSE
+//     NEW."location" := NULL;
+//   END IF;
+//   RETURN NEW;
+// END;
+// $$ LANGUAGE plpgsql;
+//
+// CREATE TRIGGER "Branch_location_sync"              BEFORE INSERT OR UPDATE ON "Branch"            FOR EACH ROW EXECUTE FUNCTION homental_sync_location();
+// CREATE TRIGGER "Address_location_sync"             BEFORE INSERT OR UPDATE ON "Address"           FOR EACH ROW EXECUTE FUNCTION homental_sync_location();
+// CREATE TRIGGER "ServiceOrder_location_sync"        BEFORE INSERT OR UPDATE ON "ServiceOrder"      FOR EACH ROW EXECUTE FUNCTION homental_sync_location();
+// CREATE TRIGGER "TechnicianProfile_location_sync"   BEFORE INSERT OR UPDATE ON "TechnicianProfile" FOR EACH ROW EXECUTE FUNCTION homental_sync_technician_location();
+//
+// -- Spatial indexes (GIST) for the 4 geography columns
+// CREATE INDEX IF NOT EXISTS "Branch_location_gist"            ON "Branch"            USING GIST ("location");
+// CREATE INDEX IF NOT EXISTS "Address_location_gist"           ON "Address"           USING GIST ("location");
+// CREATE INDEX IF NOT EXISTS "ServiceOrder_location_gist"      ON "ServiceOrder"      USING GIST ("location");
+// CREATE INDEX IF NOT EXISTS "TechnicianProfile_location_gist" ON "TechnicianProfile" USING GIST ("location");
+//
+// -- GIN index for skill-array matching in dispatch candidate queries
+// CREATE INDEX IF NOT EXISTS "TechnicianProfile_skills_gin" ON "TechnicianProfile" USING GIN ("skills");
 // ============================================================================
