@@ -1,7 +1,9 @@
 import { Controller, Get, HttpStatus, Res } from '@nestjs/common';
 import type { Response } from 'express';
 import type { HealthReport } from './health.service';
-import type { HealthService } from './health.service';
+// Value import REQUIRED: with emitDecoratorMetadata, `import type` erases the
+// DI token (design:paramtypes -> Object) and NestFactory.create crashes.
+import { HealthService } from './health.service';
 
 @Controller('health')
 export class HealthController {

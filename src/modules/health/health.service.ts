@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
-import type { PrismaService } from '@infra/prisma/prisma.service';
-import type { RedisService } from '@infra/redis/redis.service';
+// Value imports REQUIRED for NestJS DI metadata (see Part A hotfix #1).
+import { PrismaService } from '@infra/prisma/prisma.service';
+import { RedisService } from '@infra/redis/redis.service';
 
 export interface DependencyHealth {
   healthy: boolean;

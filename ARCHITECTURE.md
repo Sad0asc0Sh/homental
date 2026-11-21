@@ -32,8 +32,11 @@ space booking) **without rewriting the core**.
 | 10 | **Geo:** `Decimal` lat/lng are the source of truth in PostgreSQL; `geography(Point,4326)` columns are mirrors maintained by `BEFORE INSERT OR UPDATE` triggers. Runtime geo-matching (dispatch zones) lives in Redis GEO, keyed per city (`homental:geo:technicians:{citySlug}`). |
 | 11 | **Multi-city ready:** every Redis key, dispatch zone and branch is city/branch-scoped; core modules (`auth`, `cities-branches`, `wallet-escrow`, `notifications`) never import vertical modules. Verticals may import core. |
 | 12 | **Config is validated at startup with Zod** (`src/config`) — fail fast with readable errors. No `process.env` access outside `src/config`. |
-| 13 | **BigInt/Decimal never cross the HTTP boundary raw** — `BigIntSerializerInterceptor` converts BigInt → string, Decimal → number, so `JSON.stringify` can never crash. |
+| 13 | **BigInt/Decimal never cross the HTTP boundary raw** — `BigIntSerializerInterceptor` converts BigInt → string, Decimal → number, so `JSON.stringify` can never crash. Pub/Sub payloads use the same BigInt-safe replacer. |
 | 14 | **Pricing/advisory rule payloads are data, not code.** No `if (service === 'CCTV')` in engines; engines only interpret schemas/rules. |
+| 15 | **Auth session security:** refresh tokens are JWTs signed with `JWT_REFRESH_SECRET` whose `jti` maps to a `RefreshSession` row (SHA-256 hash stored, never the raw token). Strict rotation on every refresh; replaying a revoked token revokes ALL of the user's sessions (reuse detection). OTP codes are scrypt-hashed with per-code random salt; Redis rate limits: 1/minute + 5/hour per phone. |
+| 16 | **RBAC scoping:** `BRANCH_ADMIN` is always locked to `AuthenticatedUser.branchId` — technicians, branches and future branch-scoped resources enforce it in the SERVICE layer (not only the guard), and commission/warranty overrides are SUPER_ADMIN-only. |
+| 17 | **NestJS DI discipline:** constructor-injected classes MUST be value imports — `import type` erases `design:paramtypes` and breaks runtime DI. The rule `@typescript-eslint/consistent-type-imports` stays disabled; `src/common/di-smoke.spec.ts` is the regression guard. |
 
 ## 3. Module map
 
@@ -64,8 +67,8 @@ import core modules + infrastructure; **core modules never import verticals**.
 
 ## 4. Build order (locked)
 
-- Task 1 — Scaffold & shared infrastructure ✅ (this phase)
-- Task 2 — Auth, RBAC & org (OTP login, JWT rotation, roles, users, cities/branches, notifications core)
+- Task 1 — Scaffold & shared infrastructure ✅
+- Task 2 — Auth, RBAC & org ✅ (phone-OTP login w/ Redis rate limits, JWT access + refresh rotation with reuse-detection revocation, `@Public`/`@Roles`/`@CurrentUser` + `JwtAuthGuard`/`RolesGuard`, users & addresses, branch-scoped admin technicians, cities/branches admin CRUD with role-restricted fields, notifications core + pluggable SMS provider)
 - Task 3 — Catalog & Advisory engine (public `uiSchema` API, SecurityProfile, facts builder, JSON-Logic scoring)
 - Task 4 — Dynamic pricing engine (interpreter, supplyMode, surge, urgency, bundles, transparent breakdown)
 - Task 5 — Orders, state machine & escrow (transitions, audit, escrow hold/release, BRANCH_QUEUE)

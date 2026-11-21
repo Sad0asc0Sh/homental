@@ -14,7 +14,10 @@ export default tseslint.config(
     rules: {
       '@typescript-eslint/no-explicit-any': 'error',
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
-      '@typescript-eslint/consistent-type-imports': ['error', { prefer: 'type-imports' }],
+      // NOTE: `consistent-type-imports` is intentionally DISABLED.
+      // With emitDecoratorMetadata: true, converting constructor-injected
+      // classes to `import type` erases design:paramtypes tokens (Object) and
+      // breaks NestJS DI at runtime (Part A hotfix #1).
       'no-console': ['warn', { allow: ['error', 'warn'] }],
     },
   },

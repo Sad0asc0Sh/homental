@@ -1,26 +1,49 @@
-import type {
-  ArgumentsHost,
-  HttpException} from '@nestjs/common';
 import {
+  ArgumentsHost,
   BadRequestException,
   Catch,
   ConflictException,
+  type ExceptionFilter,
+  HttpException,
   HttpStatus,
   InternalServerErrorException,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { BaseExceptionFilter } from '@nestjs/core';
 import { Prisma } from '@prisma/client';
+import type { Request, Response } from 'express';
+import { normalizeHttpException } from './all-exceptions.filter';
 
 /**
  * Maps well-known Prisma error codes to HTTP responses with clean Persian
- * messages. Registered BEFORE AllExceptionsFilter so Prisma errors hit this
- * first; everything else falls through to the catch-all filter.
+ * messages.
+ *
+ * Part A hotfix #2:
+ *  - Implements `ExceptionFilter` DIRECTLY (the old `extends BaseExceptionFilter`
+ *    version crashed at runtime because it was constructed without an
+ *    `httpAdapter`, and `super.catch` needs one).
+ *  - Must be registered SECOND via `useGlobalFilters(All, Prisma)` — Nest runs
+ *    global filters in reverse registration order, so this filter evaluates
+ *    FIRST for `PrismaClientKnownRequestError` and the catch-all never sees it.
  */
 @Catch(Prisma.PrismaClientKnownRequestError)
-export class PrismaExceptionFilter extends BaseExceptionFilter {
-  override catch(exception: Prisma.PrismaClientKnownRequestError, host: ArgumentsHost): void {
-    super.catch(this.map(exception), host);
+export class PrismaExceptionFilter implements ExceptionFilter {
+  private readonly logger = new Logger(PrismaExceptionFilter.name);
+
+  catch(exception: Prisma.PrismaClientKnownRequestError, host: ArgumentsHost): void {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+    const request = ctx.getRequest<Request>();
+    const mapped = this.map(exception);
+    const { status, body } = normalizeHttpException(mapped, request.url);
+
+    if (status >= 500) {
+      this.logger.error(
+        `Prisma ${exception.code} at ${request.method} ${request.url} -> ${status}`,
+        exception.stack,
+      );
+    }
+    response.status(status).json(body);
   }
 
   private map(exception: Prisma.PrismaClientKnownRequestError): HttpException {

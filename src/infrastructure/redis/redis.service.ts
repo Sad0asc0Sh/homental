@@ -1,7 +1,8 @@
 import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import Redis, { Command, type RedisOptions } from 'ioredis';
-import type { AppConfigService } from '@config/app-config.service';
+// Value import REQUIRED for NestJS DI metadata (see Part A hotfix #1).
+import { AppConfigService } from '@config/app-config.service';
 
 export interface NearbyTechnician {
   techId: string;
@@ -19,6 +20,13 @@ export interface OrderLockAcquisition {
 
 export interface RedisPingResult {
   latencyMs: number;
+}
+
+export interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  /** Milliseconds until the window resets (when `allowed` is false). */
+  retryAfterMs: number;
 }
 
 export const GEO_TECH_KEY_PREFIX = 'homental:geo:technicians';
@@ -58,6 +66,47 @@ export function parseGeoSearchResponse(raw: unknown): NearbyTechnician[] {
 }
 
 /**
+ * Central pub/sub message router (Part A hotfix #3).
+ *
+ * Redis PUBLISH delivery emits `message` events as
+ * `(receivedChannel, message)` — a per-subscribe `on('message', (msg) => …)`
+ * listener receives the CHANNEL NAME as `msg`, corrupting every payload and
+ * leaking messages across channels. The dispatcher attaches ONE listener per
+ * subscriber client and routes each raw message strictly to the handlers
+ * registered for its channel.
+ */
+export class PubSubDispatcher {
+  private readonly handlers = new Map<string, Set<(message: string) => void>>();
+
+  register(channel: string, handler: (message: string) => void): void {
+    let set = this.handlers.get(channel);
+    if (!set) {
+      set = new Set();
+      this.handlers.set(channel, set);
+    }
+    set.add(handler);
+  }
+
+  /** Removes ALL handlers for the channel. Returns how many were removed. */
+  unregisterChannel(channel: string): number {
+    const set = this.handlers.get(channel);
+    if (!set) return 0;
+    this.handlers.delete(channel);
+    return set.size;
+  }
+
+  dispatch(channel: string, message: string): void {
+    const set = this.handlers.get(channel);
+    if (!set) return;
+    for (const handler of set) handler(message);
+  }
+
+  handlerCount(channel: string): number {
+    return this.handlers.get(channel)?.size ?? 0;
+  }
+}
+
+/**
  * Redis infrastructure — separate command & subscriber clients.
  *
  * `enableOfflineQueue: false` + `maxRetriesPerRequest: 1` make commands fail
@@ -70,7 +119,7 @@ export class RedisService implements OnModuleDestroy {
   private readonly logger = new Logger(RedisService.name);
   readonly command: Redis;
   readonly subscriber: Redis;
-  private readonly channelListeners = new Map<string, (message: string) => void>();
+  private readonly pubSub = new PubSubDispatcher();
 
   constructor(private readonly config: AppConfigService) {
     const options: RedisOptions = {
@@ -88,6 +137,10 @@ export class RedisService implements OnModuleDestroy {
     this.subscriber.on('error', (error: Error) =>
       this.logger.error(`Redis subscriber client error: ${error.message}`),
     );
+    // ONE central 'message' listener: signature is (receivedChannel, message).
+    this.subscriber.on('message', (receivedChannel: string, message: string) => {
+      this.pubSub.dispatch(receivedChannel, message);
+    });
   }
 
   // ── GEO (dispatch technician index, city-scoped) ──────────────────────────
@@ -119,17 +172,17 @@ export class RedisService implements OnModuleDestroy {
       new Command(
         'GEOSEARCH',
         [
-      this.geoKey(citySlug),
-      'FROMLONLAT',
-      lng,
-      lat,
-      'BYRADIUS',
-      radiusMeters,
-      'm',
-      'ASC',
-      'COUNT',
-      limit,
-      'WITHDIST',
+          this.geoKey(citySlug),
+          'FROMLONLAT',
+          lng,
+          lat,
+          'BYRADIUS',
+          radiusMeters,
+          'm',
+          'ASC',
+          'COUNT',
+          limit,
+          'WITHDIST',
           'WITHCOORD',
         ],
         { replyEncoding: 'utf8' },
@@ -157,14 +210,30 @@ export class RedisService implements OnModuleDestroy {
     return Number(result) === 1;
   }
 
-  // ── Pub/Sub (BigInt-safe) ─────────────────────────────────────────────────
+  // ── Rate limiting (INCR + PEXPIRE sliding window) ─────────────────────────
+
+  async rateLimit(key: string, limit: number, windowMs: number): Promise<RateLimitResult> {
+    const count = await this.command.incr(key);
+    if (count === 1) {
+      await this.command.pexpire(key, windowMs);
+    }
+    const ttl = await this.command.pttl(key);
+    const retryAfterMs = ttl > 0 ? ttl : windowMs;
+    return {
+      allowed: count <= limit,
+      remaining: Math.max(0, limit - count),
+      retryAfterMs,
+    };
+  }
+
+  // ── Pub/Sub (BigInt-safe, strictly per-channel routed) ────────────────────
 
   async publish<T>(channel: string, payload: T): Promise<void> {
     await this.command.publish(channel, JSON.stringify(payload, bigIntSafeReplacer));
   }
 
   async subscribe<T>(channel: string, handler: (payload: T) => void | Promise<void>): Promise<void> {
-    const listener = (message: string): void => {
+    const wrapped = (message: string): void => {
       let payload: T;
       try {
         payload = JSON.parse(message) as T;
@@ -180,18 +249,17 @@ export class RedisService implements OnModuleDestroy {
         ),
       );
     };
-    await this.subscriber.subscribe(channel);
-    this.subscriber.on('message', listener);
-    this.channelListeners.set(channel, listener);
+    this.pubSub.register(channel, wrapped);
+    if (this.pubSub.handlerCount(channel) === 1) {
+      await this.subscriber.subscribe(channel);
+    }
   }
 
   async unsubscribe(channel: string): Promise<void> {
-    const listener = this.channelListeners.get(channel);
-    if (listener) {
-      this.subscriber.off('message', listener);
-      this.channelListeners.delete(channel);
+    const removed = this.pubSub.unregisterChannel(channel);
+    if (removed > 0) {
+      await this.subscriber.unsubscribe(channel);
     }
-    await this.subscriber.unsubscribe(channel);
   }
 
   // ── Health & lifecycle ────────────────────────────────────────────────────
@@ -206,6 +274,14 @@ export class RedisService implements OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
-    await Promise.allSettled([this.command.quit(), this.subscriber.quit()]);
+    const close = async (client: Redis): Promise<void> => {
+      try {
+        await client.quit();
+      } catch {
+        // Never fully connected (quit hangs during reconnect) — force close.
+        client.disconnect();
+      }
+    };
+    await Promise.allSettled([close(this.command), close(this.subscriber)]);
   }
 }

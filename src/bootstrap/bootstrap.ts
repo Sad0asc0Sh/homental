@@ -28,8 +28,14 @@ export async function bootstrap(): Promise<INestApplication> {
     }),
   );
   app.useGlobalInterceptors(new BigIntSerializerInterceptor());
-  // Prisma filter first (specific), catch-all second.
-  app.useGlobalFilters(new PrismaExceptionFilter(), new AllExceptionsFilter());
+  // Nest executes global filters in REVERSE registration order
+  // (router-exception-filters.js: `filters.reverse()` + `.find()`).
+  // Registering AllExceptionsFilter FIRST puts the Prisma-specific filter
+  // at the front of the selection list; the catch-all runs last.
+  app.useGlobalFilters(new AllExceptionsFilter(), new PrismaExceptionFilter());
+
+  // Public health probe stays unprefixed; everything else is /api/v1/*.
+  app.setGlobalPrefix('api/v1', { exclude: ['health'] });
 
   const swaggerConfig = new DocumentBuilder()
     .setTitle('Homental API')

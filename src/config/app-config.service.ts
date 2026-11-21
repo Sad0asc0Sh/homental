@@ -39,4 +39,36 @@ export class AppConfigService {
       .map((origin) => origin.trim())
       .filter((origin) => origin.length > 0);
   }
+
+  // ── Auth / JWT ────────────────────────────────────────────────────────────
+
+  get jwtAccessSecret(): string {
+    return this.env.JWT_ACCESS_SECRET;
+  }
+
+  get jwtRefreshSecret(): string {
+    return this.env.JWT_REFRESH_SECRET;
+  }
+
+  get jwtAccessTtl(): string {
+    return this.env.JWT_ACCESS_TTL;
+  }
+
+  get jwtRefreshTtl(): string {
+    return this.env.JWT_REFRESH_TTL;
+  }
+
+  // ── OTP ───────────────────────────────────────────────────────────────────
+
+  get otpTtlSeconds(): number {
+    return this.env.OTP_TTL_SECONDS;
+  }
+
+  get otpMaxAttempts(): number {
+    return this.env.OTP_MAX_ATTEMPTS;
+  }
+
+  get otpDevEcho(): boolean {
+    return this.env.OTP_DEV_ECHO;
+  }
 }

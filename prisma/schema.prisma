@@ -264,7 +264,6 @@ model TechnicianProfile {
 
   @@index([branchId])
   @@index([status, isOnline, isAcceptingOffers])
-  @@index([skills])
 }
 
 // ============================================================================
@@ -698,7 +697,7 @@ model Review {
 // CREATE OR REPLACE FUNCTION homental_sync_location() RETURNS trigger AS $$
 // BEGIN
 //   IF NEW."lat" IS NOT NULL AND NEW."lng" IS NOT NULL THEN
-//     NEW."location" := ST_SetSRID(ST_MakePoint(NEW."lng", NEW."lat"), 4326)::geography;
+//     NEW."location" := ST_SetSRID(ST_MakePoint(NEW."lng"::double precision, NEW."lat"::double precision), 4326)::geography;
 //   ELSE
 //     NEW."location" := NULL;
 //   END IF;
@@ -710,7 +709,7 @@ model Review {
 // CREATE OR REPLACE FUNCTION homental_sync_technician_location() RETURNS trigger AS $$
 // BEGIN
 //   IF NEW."lastKnownLat" IS NOT NULL AND NEW."lastKnownLng" IS NOT NULL THEN
-//     NEW."location" := ST_SetSRID(ST_MakePoint(NEW."lastKnownLng", NEW."lastKnownLat"), 4326)::geography;
+//     NEW."location" := ST_SetSRID(ST_MakePoint(NEW."lastKnownLng"::double precision, NEW."lastKnownLat"::double precision), 4326)::geography;
 //   ELSE
 //     NEW."location" := NULL;
 //   END IF;
@@ -718,10 +717,10 @@ model Review {
 // END;
 // $$ LANGUAGE plpgsql;
 //
-// CREATE TRIGGER "Branch_location_sync"              BEFORE INSERT OR UPDATE ON "Branch"            FOR EACH ROW EXECUTE FUNCTION homental_sync_location();
-// CREATE TRIGGER "Address_location_sync"             BEFORE INSERT OR UPDATE ON "Address"           FOR EACH ROW EXECUTE FUNCTION homental_sync_location();
-// CREATE TRIGGER "ServiceOrder_location_sync"        BEFORE INSERT OR UPDATE ON "ServiceOrder"      FOR EACH ROW EXECUTE FUNCTION homental_sync_location();
-// CREATE TRIGGER "TechnicianProfile_location_sync"   BEFORE INSERT OR UPDATE ON "TechnicianProfile" FOR EACH ROW EXECUTE FUNCTION homental_sync_technician_location();
+// CREATE TRIGGER "Branch_location_sync"              BEFORE INSERT OR UPDATE OF "lat", "lng"                 ON "Branch"            FOR EACH ROW EXECUTE FUNCTION homental_sync_location();
+// CREATE TRIGGER "Address_location_sync"             BEFORE INSERT OR UPDATE OF "lat", "lng"                 ON "Address"           FOR EACH ROW EXECUTE FUNCTION homental_sync_location();
+// CREATE TRIGGER "ServiceOrder_location_sync"        BEFORE INSERT OR UPDATE OF "lat", "lng"                 ON "ServiceOrder"      FOR EACH ROW EXECUTE FUNCTION homental_sync_location();
+// CREATE TRIGGER "TechnicianProfile_location_sync"   BEFORE INSERT OR UPDATE OF "lastKnownLat", "lastKnownLng" ON "TechnicianProfile" FOR EACH ROW EXECUTE FUNCTION homental_sync_technician_location();
 //
 // -- Spatial indexes (GIST) for the 4 geography columns
 // CREATE INDEX IF NOT EXISTS "Branch_location_gist"            ON "Branch"            USING GIST ("location");
