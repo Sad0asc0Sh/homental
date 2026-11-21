@@ -31,6 +31,13 @@ export const SCORING = {
   goalCardBonus: 2,
   /** Cap per active service so stacking switches can never exceed the base. */
   maxServiceBonus: 20,
+  /**
+   * Gap-free completion bonus (Part A fix): a pillar with at least one ACTIVE
+   * service and ZERO open advisory gaps is considered "engineering-complete"
+   * and earns this bonus — without it, base scores (40–55) + capped switch
+   * bonuses could never reach the ≥85 «امنیت مهندسی کامل» tier.
+   */
+  gapFreeCompletionBonus: 35,
 } as const;
 
 const READINESS_TIERS = [
@@ -75,13 +82,15 @@ function tierFor(total: number): string {
 
 /**
  * Context-aware 3-pillar readiness (0–100): pillar = Σ(base + bounded config
- * bonus) of active services in that pillar; total = Σ pillar × location weight.
- * Applying an advisory's `suggestedConfig` or adding a service measurably
- * raises the pillar and total scores.
+ * bonus) of active services in that pillar; a pillar with ≥1 active service
+ * and ZERO open advisory gaps earns the gap-free completion bonus; total =
+ * Σ pillar × location weight. Resolving an advisory gap or adding a service
+ * measurably raises the pillar and total scores.
  */
 export function computeReadinessScore(
   facts: AdvisoryFacts,
   definitions: ScoringDefinition[],
+  gapPillars: ReadonlySet<SecurityPillar> = new Set<SecurityPillar>(),
 ): ReadinessScore {
   const weights = LOCATION_PILLAR_WEIGHTS[facts.locationType as LocationType] ?? {
     physical: 1 / 3,
@@ -89,30 +98,34 @@ export function computeReadinessScore(
     monitoring: 1 / 3,
   };
 
-  const rawPillars: Record<'physical' | 'intrusion' | 'monitoring', number> = {
-    physical: 0,
-    intrusion: 0,
-    monitoring: 0,
-  };
+  const rawByPillar = new Map<SecurityPillar, number>();
 
   for (const definition of definitions) {
     const serviceFacts = facts.services[definition.key];
     if (!serviceFacts?.active) continue;
     const bonus = serviceConfigBonus(definition.uiSchema, serviceFacts);
     const contribution = Math.min(definition.baseReadinessScore + bonus, 100);
-    const pillarKey = PILLAR_SCORE_KEY[definition.pillar];
-    rawPillars[pillarKey] = Math.min(rawPillars[pillarKey] + contribution, 100);
+    const current = rawByPillar.get(definition.pillar) ?? 0;
+    rawByPillar.set(definition.pillar, Math.min(current + contribution, 100));
   }
 
   const pillarScores = {
-    physical: Math.round(rawPillars.physical),
-    intrusion: Math.round(rawPillars.intrusion),
-    monitoring: Math.round(rawPillars.monitoring),
+    physical: 0,
+    intrusion: 0,
+    monitoring: 0,
   };
+  for (const [pillar, raw] of rawByPillar) {
+    const key = PILLAR_SCORE_KEY[pillar];
+    const gapFree = raw > 0 && !gapPillars.has(pillar);
+    pillarScores[key] = gapFree
+      ? Math.min(raw + SCORING.gapFreeCompletionBonus, 100)
+      : Math.round(raw);
+  }
+
   const total = Math.round(
-    rawPillars.physical * weights.physical +
-      rawPillars.intrusion * weights.intrusion +
-      rawPillars.monitoring * weights.monitoring,
+    pillarScores.physical * weights.physical +
+      pillarScores.intrusion * weights.intrusion +
+      pillarScores.monitoring * weights.monitoring,
   );
 
   return { ...pillarScores, total, levelFa: tierFor(total) };

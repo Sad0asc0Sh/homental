@@ -3,6 +3,7 @@ import {
   IsBoolean,
   IsIn,
   IsInt,
+  IsNumber,
   IsObject,
   IsOptional,
   IsString,
@@ -12,7 +13,7 @@ import {
   Max,
   Min,
 } from 'class-validator';
-import { LocationType, SecurityPillar, ServiceKey } from '@prisma/client';
+import { LocationType, SecurityPillar, ServiceKey, SupplyMode, UrgencyLevel } from '@prisma/client';
 import type { ServiceConfigAnswer } from '../advisory.types';
 
 // ── Guest / customer evaluation ──────────────────────────────────────────────
@@ -28,6 +29,36 @@ export class EvaluateAdvisoryDto {
   @IsOptional()
   @IsObject()
   servicesConfig?: Record<string, ServiceConfigAnswer>;
+
+  // ── One-call Sticky Live Bar pricing options (Part B, Task 4) ──────────────
+
+  @IsOptional()
+  @IsBoolean()
+  includePricing?: boolean;
+
+  @IsOptional()
+  @IsString()
+  citySlug?: string;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(-90)
+  @Max(90)
+  lat?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(-180)
+  @Max(180)
+  lng?: number;
+
+  @IsOptional()
+  @IsIn(Object.values(UrgencyLevel))
+  urgency?: UrgencyLevel;
+
+  @IsOptional()
+  @IsIn(Object.values(SupplyMode))
+  supplyMode?: SupplyMode;
 }
 
 // ── Security profiles (CUSTOMER) ─────────────────────────────────────────────

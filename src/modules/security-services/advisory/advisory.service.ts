@@ -1,8 +1,9 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import type { LocationType, Prisma, SecurityPillar, ServiceKey } from '@prisma/client';
+import type { LocationType, Prisma, SecurityPillar, ServiceKey, SupplyMode, UrgencyLevel } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import { PrismaService } from '@infra/prisma/prisma.service';
 import { JsonLogicEvaluator } from '../shared/json-logic.evaluator';
+import { PricingService } from '../pricing/pricing.service';
 import type {
   Advisory,
   AdvisoryFacts,
@@ -10,6 +11,7 @@ import type {
   ServiceConfigAnswer,
   SmartBrief,
 } from './advisory.types';
+import type { EvaluatePricingOptions } from './advisory.types';
 import type {
   BuildFactsInput,
   FactsDefinition,
@@ -34,23 +36,64 @@ export class AdvisoryService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly evaluator: JsonLogicEvaluator,
+    private readonly pricingService: PricingService,
   ) {}
 
   // ── Decoupled evaluation engine (guest-friendly, @Public) ─────────────────
 
-  async evaluate(input: BuildFactsInput): Promise<EvaluateAdvisoryResult> {
+  /**
+   * One-call engine for the Next.js Sticky Live Bar: readiness + top-2
+   * advisories + smart brief, and — when `includePricing` is set — the live
+   * BigInt pricing estimate for the currently active configuration.
+   */
+  async evaluate(
+    input: BuildFactsInput & EvaluatePricingOptions,
+  ): Promise<EvaluateAdvisoryResult> {
     const definitions = await this.prisma.serviceDefinition.findMany({
       where: { isActive: true },
     });
     const facts = buildAdvisoryFacts(input, definitions as FactsDefinition[]);
-    const readiness = computeReadinessScore(facts, definitions);
-    const advisories = await this.matchAdvisories(facts);
+    const matched = await this.matchAdvisories(facts);
+    const readiness = computeReadinessScore(facts, definitions, matched.gapPillars);
     const smartBrief = this.buildSmartBrief(input.locationType, facts, definitions);
-    return { readiness, advisories, smartBrief };
+
+    let pricing;
+    if (input.includePricing === true) {
+      const activeItems = matched.activeServiceKeys.map((serviceKey) => {
+        const factsEntry = facts.services[serviceKey];
+        const config: Record<string, unknown> = { ...(factsEntry ?? {}) };
+        delete config['active']; // not a pricing variable
+        delete config['goals']; // qualitative only
+        return {
+          serviceKey,
+          supplyMode: input.supplyMode as SupplyMode | undefined,
+          config,
+        };
+      });
+      if (activeItems.length > 0) {
+        pricing = await this.pricingService.estimate({
+          citySlug: input.citySlug,
+          lat: input.lat,
+          lng: input.lng,
+          urgency: input.urgency as UrgencyLevel | undefined,
+          supplyMode: (input.supplyMode as SupplyMode | undefined) ?? undefined,
+          items: activeItems,
+        });
+      }
+    }
+
+    return { readiness, advisories: matched.advisories, smartBrief, pricing };
   }
 
-  /** Rules whose `appliesToLocationTypes` is empty or contains the location. */
-  private async matchAdvisories(facts: AdvisoryFacts): Promise<Advisory[]> {
+  /**
+   * Rules whose `appliesToLocationTypes` is empty or contains the location.
+   * Returns the top-2 advisories AND the full set of pillars with open gaps
+   * (derived from ALL matched rules — a hidden 3rd gap still suppresses the
+   * gap-free completion bonus).
+   */
+  private async matchAdvisories(
+    facts: AdvisoryFacts,
+  ): Promise<{ advisories: Advisory[]; gapPillars: Set<SecurityPillar>; activeServiceKeys: ServiceKey[] }> {
     const rules = await this.prisma.advisoryRule.findMany({
       where: {
         isActive: true,
@@ -61,23 +104,28 @@ export class AdvisoryService {
       },
       orderBy: { priority: 'asc' },
     });
-    return rules
-      .filter((rule) => this.evaluator.evaluateBoolean(rule.condition, facts))
-      .slice(0, MAX_ADVISORIES)
-      .map((rule) => ({
-        code: rule.code,
-        pillar: rule.pillar,
-        priority: rule.priority,
-        messageFa: rule.suggestedActionFa,
-        scoreImpact: (rule.scoreImpact as Record<string, unknown> | null) ?? null,
-        suggestedAction: rule.suggestedServiceKey
-          ? {
-              type: 'APPLY_SERVICE_CONFIG' as const,
-              serviceKey: rule.suggestedServiceKey,
-              configPatch: (rule.suggestedConfig as Record<string, unknown> | null) ?? {},
-            }
-          : null,
-      }));
+
+    const matchedRules = rules.filter((rule) => this.evaluator.evaluateBoolean(rule.condition, facts));
+    const gapPillars = new Set<SecurityPillar>(matchedRules.map((rule) => rule.pillar));
+    const activeServiceKeys = Object.entries(facts.services)
+      .filter(([, value]) => value.active === true)
+      .map(([key]) => key as ServiceKey);
+
+    const advisories = matchedRules.slice(0, MAX_ADVISORIES).map((rule) => ({
+      code: rule.code,
+      pillar: rule.pillar,
+      priority: rule.priority,
+      messageFa: rule.suggestedActionFa,
+      scoreImpact: (rule.scoreImpact as Record<string, unknown> | null) ?? null,
+      suggestedAction: rule.suggestedServiceKey
+        ? {
+            type: 'APPLY_SERVICE_CONFIG' as const,
+            serviceKey: rule.suggestedServiceKey,
+            configPatch: (rule.suggestedConfig as Record<string, unknown> | null) ?? {},
+          }
+        : null,
+    }));
+    return { advisories, gapPillars, activeServiceKeys };
   }
 
   private buildSmartBrief(

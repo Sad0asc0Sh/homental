@@ -19,10 +19,30 @@ function cloneSeed() {
   }));
 }
 
-function buildService() {
+/** Emulates Prisma list filtering (isActive + supportedLocationTypes.has). */
+function makeDefinitionFindManyMock(seed: Array<Record<string, unknown>>) {
+  return jest.fn(async (args?: {
+    where?: { isActive?: boolean; supportedLocationTypes?: { has?: string } };
+  }) => {
+    let definitions = [...seed];
+    const where = args?.where;
+    if (where?.isActive === true) {
+      definitions = definitions.filter((definition) => definition['isActive'] !== false);
+    }
+    const has = where?.supportedLocationTypes?.has;
+    if (has !== undefined) {
+      definitions = definitions.filter((definition) =>
+        ((definition['supportedLocationTypes'] as string[] | undefined) ?? []).includes(has),
+      );
+    }
+    return definitions;
+  });
+}
+
+function buildService(extraSeed: Array<Record<string, unknown>> = []) {
   const prisma = {
     serviceDefinition: {
-      findMany: jest.fn().mockResolvedValue(cloneSeed()),
+      findMany: makeDefinitionFindManyMock([...cloneSeed(), ...extraSeed] as Array<Record<string, unknown>>),
       findUnique: jest.fn(),
       update: jest.fn(),
       create: jest.fn(async ({ data }: { data: unknown }) => data),
@@ -103,6 +123,34 @@ describe('CatalogService — public 3-pillar schemas + locationType filtering', 
 
     (prisma.serviceDefinition.findUnique as jest.Mock).mockResolvedValue(null);
     await expect(service.getSchema('CCTV')).rejects.toThrow(NotFoundException);
+  });
+
+  it('excludes location-restricted services from unsupported locations (Part A fix)', async () => {
+    const restricted = {
+      key: 'SHOP_ONLY_SERVICE',
+      pillar: 'PHYSICAL',
+      version: 1,
+      isActive: true,
+      titleFa: 'سرویس ویژه مغازه و انبار',
+      subtitleFa: null,
+      descriptionFa: null,
+      iconKey: null,
+      supportedLocationTypes: ['SHOP', 'WAREHOUSE'],
+      warrantyMonths: 12,
+      uiSchema: {},
+    };
+    const { service } = buildService([restricted]);
+
+    const shopResult = await service.listSchemas('SHOP' as LocationType);
+    const apartmentResult = await service.listSchemas('APARTMENT' as LocationType);
+    const shopKeys = shopResult.pillars.flatMap((p) => p.services.map((s) => s.key));
+    const apartmentKeys = apartmentResult.pillars.flatMap((p) => p.services.map((s) => s.key));
+
+    expect(shopKeys).toContain('SHOP_ONLY_SERVICE');
+    expect(apartmentKeys).not.toContain('SHOP_ONLY_SERVICE');
+    // Unfiltered (no locationType) still lists everything.
+    const allKeys = (await service.listSchemas()).pillars.flatMap((p) => p.services.map((s) => s.key));
+    expect(allKeys).toContain('SHOP_ONLY_SERVICE');
   });
 
   it('recommended presets cover all five location types (Dual-Path Path 1)', () => {

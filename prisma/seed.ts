@@ -1178,11 +1178,12 @@ export const platformConfigs = [
   {
     key: 'pricing.surge',
     value: {
-      // supply/demand ratio = online skilled technicians / pending orders in the Redis GEO zone
+      // supply/demand ratio = pending orders / online technicians in the Redis GEO zone
       minMultiplier: 1.0,
       maxMultiplier: 1.25, // trust cap — Homental never surges above 25%
       balancedRatio: 1.0, // ratio >= this => no surge
       scarceRatio: 0.4, // ratio <= this => max surge
+      surgeRadiusMeters: 3000, // Redis GEO radius for counting active techs
     },
   },
   {

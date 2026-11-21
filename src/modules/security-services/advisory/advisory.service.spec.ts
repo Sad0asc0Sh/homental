@@ -4,9 +4,12 @@ import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import type { PrismaService } from '@infra/prisma/prisma.service';
 import { advisoryRules, serviceDefinitions } from '../../../../prisma/seed';
 import { buildAdvisoryFacts } from './facts.builder';
-import { computeReadinessScore } from './readiness.scorer';
+import { computeReadinessScore, SCORING } from './readiness.scorer';
 import { AdvisoryService } from './advisory.service';
 import { JsonLogicEvaluator } from '../shared/json-logic.evaluator';
+import { PricingSchemaInterpreter } from '../pricing/pricing-schema.interpreter';
+import { PricingService } from '../pricing/pricing.service';
+import type { DynamicFactorsService } from '../pricing/dynamic-factors.service';
 
 const seedDefinitions = serviceDefinitions.map((definition) => ({
   ...definition,
@@ -82,8 +85,22 @@ function buildService(ruleOverrides?: unknown[]) {
       update: jest.fn(),
     },
   } as unknown as PrismaService;
-  const service = new AdvisoryService(prisma, new JsonLogicEvaluator());
-  return { service, prisma };
+  const factors = {
+    getSurge: jest
+      .fn()
+      .mockResolvedValue({ multiplier: 1, activeTechs: 0, pendingOrders: 0, reasonFa: 'تعرفه عادی' }),
+    getUrgency: jest.fn().mockResolvedValue({ urgency: 'SCHEDULED', multiplier: 1 }),
+    getBundleDiscountPercent: jest.fn(async (count: number) =>
+      count >= 3 ? 10 : count === 2 ? 6 : 0,
+    ),
+  } as unknown as DynamicFactorsService;
+  const pricingService = new PricingService(
+    prisma,
+    new PricingSchemaInterpreter(new JsonLogicEvaluator()),
+    factors,
+  );
+  const service = new AdvisoryService(prisma, new JsonLogicEvaluator(), pricingService);
+  return { service, prisma, pricingService, factors };
 }
 
 const codes = (advisories: Array<{ code: string }>) => advisories.map((a) => a.code);
@@ -151,17 +168,20 @@ describe('AdvisoryService — all 7 seeded rules (real seed data)', () => {
     expect(codes(warehouseResult.advisories)).toEqual(['WAREHOUSE_ALARM_NO_CCTV']);
   });
 
-  it('a fully covered SHOP (steel shutter + UPS + ALARM + CCTV) fires nothing', async () => {
+  it('a fully covered SHOP with every protective switch fires nothing AND reaches the top tier', async () => {
     const { service } = buildService();
     const result = await service.evaluate({
       locationType: 'SHOP',
       servicesConfig: {
-        CCTV: { active: true },
-        ALARM: { active: true },
+        CCTV: { active: true, nightPlate: true, colorNight: true, audioRecord: true },
+        ALARM: { active: true, panicButton: true },
         ELECTRIC_SHUTTER: { active: true, bladeType: 'STEEL_HEAVY', upsBackup: true },
       },
     });
     expect(result.advisories).toEqual([]);
+    // Part A proof: zero open gaps → gap-free completion bonus → ≥ 85 tier.
+    expect(result.readiness.total).toBeGreaterThanOrEqual(85);
+    expect(result.readiness.levelFa).toBe('امنیت مهندسی کامل');
   });
 
   it('priority ordering + strict max-2 cap when 3+ rules match simultaneously', async () => {
@@ -246,8 +266,9 @@ describe('Readiness scorer — context-aware 3-pillar progression', () => {
       seedDefinitions,
     );
     const readiness = computeReadinessScore(facts, seedDefinitions);
-    expect(readiness.monitoring).toBe(40);
-    expect(readiness.total).toBe(Math.round(0.35 * 40)); // 14 (APARTMENT monitoring weight)
+    // Monitoring is active & gap-free → raw 40 + gap-free completion bonus 35.
+    expect(readiness.monitoring).toBe(40 + SCORING.gapFreeCompletionBonus);
+    expect(readiness.total).toBe(Math.round(0.35 * (40 + SCORING.gapFreeCompletionBonus))); // 26
     expect(readiness.levelFa).toBe('نیاز به تقویت فوری');
   });
 
@@ -269,14 +290,14 @@ describe('Readiness scorer — context-aware 3-pillar progression', () => {
 
     expect(after.readiness.intrusion).toBeGreaterThan(before.readiness.intrusion);
     expect(after.readiness.total).toBeGreaterThan(before.readiness.total);
-    expect(before.readiness.total).toBe(14);
-    // ALARM base 45 + panic switch bonus 4 → intrusion 49; total = 0.45*49 + 0.35*40 ≈ 36
-    expect(after.readiness.intrusion).toBe(49);
-    expect(after.readiness.total).toBe(36);
-    expect(after.readiness.levelFa).toBe('پوشش پایه');
+    expect(before.readiness.total).toBe(26); // monitoring 75 × 0.35
+    // ALARM raw 45 + panic bonus 4 = 49 → gap-free bonus → 84; total = 0.45×84 + 0.35×75 ≈ 64
+    expect(after.readiness.intrusion).toBe(84);
+    expect(after.readiness.total).toBe(64);
+    expect(after.readiness.levelFa).toBe('پوشش استاندارد');
   });
 
-  it('applying only a configPatch (UPS on steel-path shop) raises the physical pillar', async () => {
+  it('applying only a configPatch (UPS on steel-path shop) resolves the gap AND lifts the pillar', async () => {
     const { service } = buildService();
     const before = await service.evaluate({
       locationType: 'SHOP',
@@ -288,7 +309,12 @@ describe('Readiness scorer — context-aware 3-pillar progression', () => {
         ELECTRIC_SHUTTER: { active: true, bladeType: 'STEEL_HEAVY', upsBackup: true },
       },
     });
-    expect(after.readiness.physical).toBe(before.readiness.physical + 4); // upsBackup switch bonus
+    // Before: SHOP_SENSITIVE gap → PHYSICAL gets NO bonus (raw 50) → total 18.
+    expect(before.readiness.physical).toBe(50);
+    expect(before.readiness.total).toBe(18);
+    // After: gap resolved + upsBackup switch bonus → raw 54 +35 = 89.
+    expect(after.readiness.physical).toBe(89);
+    expect(after.readiness.total).toBe(31); // round(0.35 × 89)
     expect(after.readiness.total).toBeGreaterThan(before.readiness.total);
   });
 
@@ -302,9 +328,21 @@ describe('Readiness scorer — context-aware 3-pillar progression', () => {
       buildAdvisoryFacts({ locationType: 'APARTMENT', servicesConfig: config }, seedDefinitions),
       seedDefinitions,
     );
-    // PARKING weights physical at 0.50, APARTMENT at 0.20 — same coverage, different totals
-    expect(parking.total).toBe(28); // 55 * 0.50
-    expect(apartment.total).toBe(11); // 55 * 0.20
+    // Raw physical 55 + gap-free bonus 35 = 90; weights differ per location.
+    expect(parking.total).toBe(45); // 90 × 0.50
+    expect(apartment.total).toBe(18); // 90 × 0.20
+  });
+
+  it('a pillar with an open advisory gap NEVER receives the completion bonus (Part A)', () => {
+    const facts = buildAdvisoryFacts(
+      { locationType: 'APARTMENT', servicesConfig: { PARKING_JACK: { active: true } } },
+      seedDefinitions,
+    );
+    const withGap = computeReadinessScore(facts, seedDefinitions, new Set(['PHYSICAL']));
+    const gapFree = computeReadinessScore(facts, seedDefinitions, new Set());
+    expect(withGap.physical).toBe(55);
+    expect(gapFree.physical).toBe(90);
+    expect(gapFree.total).toBeGreaterThan(withGap.total);
   });
 });
 
@@ -375,6 +413,50 @@ describe('AdvisoryService — customer security profiles (customer-scoped)', () 
     await expect(
       service.createProfile(customer, { addressId: 'addr1' }),
     ).rejects.toThrow(ForbiddenException);
+  });
+});
+
+describe('AdvisoryService — one-call Sticky Live Bar (includePricing, Task 4)', () => {
+  it('returns readiness + advisories + smartBrief + pricing in ONE call', async () => {
+    const { service } = buildService();
+    const result = await service.evaluate({
+      locationType: 'SHOP',
+      includePricing: true,
+      servicesConfig: {
+        CCTV: { active: true, cameraCount: 4 },
+        ALARM: { active: true },
+      },
+    });
+
+    expect(result.pricing).toBeDefined();
+    expect(result.pricing?.currency).toBe('TOMAN');
+    expect(typeof result.pricing?.estimatedMin).toBe('bigint');
+    expect(result.pricing?.estimatedMin).toBeLessThanOrEqual(result.pricing!.netEstimated);
+    expect(result.pricing!.estimatedMax).toBeGreaterThanOrEqual(result.pricing!.netEstimated);
+    // 2 distinct active services → 6% bundle discount in the same response.
+    expect(result.pricing?.summary.bundleDiscountPercent).toBe(6);
+    expect(result.readiness).toBeDefined();
+    expect(result.smartBrief.activeServiceKeys).toEqual(['CCTV', 'ALARM']);
+  });
+
+  it('omits the pricing key entirely when includePricing is not requested', async () => {
+    const { service } = buildService();
+    const result = await service.evaluate({
+      locationType: 'APARTMENT',
+      servicesConfig: { CCTV: { active: true } },
+    });
+    expect(result.pricing).toBeUndefined();
+  });
+
+  it('empty active configuration with includePricing → no pricing section, no crash', async () => {
+    const { service } = buildService();
+    const result = await service.evaluate({
+      locationType: 'SHOP',
+      includePricing: true,
+      servicesConfig: {},
+    });
+    expect(result.pricing).toBeUndefined();
+    expect(result.readiness.total).toBe(0);
   });
 });
 

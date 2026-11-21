@@ -1,4 +1,5 @@
 import type { SecurityPillar, ServiceKey } from '@prisma/client';
+import type { PricingEstimateResult } from '../pricing/pricing.service';
 
 // ── Facts document (the single contract between UI answers and rule logic) ──
 
@@ -63,8 +64,19 @@ export interface SmartBrief {
   missingPillars: SecurityPillar[];
 }
 
+export interface EvaluatePricingOptions {
+  includePricing?: boolean;
+  citySlug?: string;
+  lat?: number;
+  lng?: number;
+  urgency?: string;
+  supplyMode?: string;
+}
+
 export interface EvaluateAdvisoryResult {
   readiness: ReadinessScore;
   advisories: Advisory[];
   smartBrief: SmartBrief;
+  /** Present ONLY when the caller asked for the one-call Sticky Live Bar. */
+  pricing?: PricingEstimateResult;
 }

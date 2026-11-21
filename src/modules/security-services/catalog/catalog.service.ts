@@ -132,7 +132,12 @@ export class CatalogService {
     recommendedPreset: RecommendedPreset | null;
   }> {
     const definitions = await this.prisma.serviceDefinition.findMany({
-      where: { isActive: true },
+      where: {
+        isActive: true,
+        // Part A fix: services limited to e.g. ['SHOP','WAREHOUSE'] must never
+        // appear in an APARTMENT catalog.
+        ...(locationType ? { supportedLocationTypes: { has: locationType } } : {}),
+      },
       orderBy: { displayOrder: 'asc' },
     });
 
