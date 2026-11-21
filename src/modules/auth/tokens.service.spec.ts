@@ -157,6 +157,34 @@ describe('TokensService — strict rotation (Part B #3)', () => {
     await expect(service.rotate('not-a-jwt')).rejects.toThrow(UnauthorizedException);
     expect(prisma.refreshSession.findUnique).not.toHaveBeenCalled();
   });
+
+  // ── Part A hotfix #2: suspended users can never rotate tokens ──────────────
+
+  it.each(['SUSPENDED', 'DEACTIVATED'] as const)(
+    'blocks rotation for a %s user: revokes ALL sessions and returns 401',
+    async (status) => {
+      const { service, prisma, jwtService } = buildService();
+      const token = await jwtService.signAsync(
+        { sub: 'u1', type: 'refresh' },
+        { secret: REFRESH_SECRET, jwtid: 's1', expiresIn: '30d' },
+      );
+      (prisma.refreshSession.findUnique as jest.Mock).mockResolvedValue({
+        id: 's1',
+        userId: 'u1',
+        tokenHash: sha256(token),
+        revokedAt: null,
+        expiresAt: new Date(Date.now() + 1_000_000_000),
+        user: { ...fakeUser, status },
+      });
+
+      await expect(service.rotate(token)).rejects.toThrow(UnauthorizedException);
+      expect(prisma.refreshSession.updateMany).toHaveBeenCalledWith({
+        where: { userId: 'u1', revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(prisma.refreshSession.update).not.toHaveBeenCalled(); // no rotation
+    },
+  );
 });
 
 describe('TokensService — logout helpers', () => {

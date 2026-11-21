@@ -1,4 +1,10 @@
-import { HttpException, HttpStatus, Inject, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  HttpException,
+  HttpStatus,
+  Inject,
+  Injectable,
+} from '@nestjs/common';
 import type { OtpCode, Prisma } from '@prisma/client';
 import { randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto';
 import { AppConfigService } from '@config/app-config.service';
@@ -124,9 +130,22 @@ export class OtpService {
     return record;
   }
 
-  /** Marks the OTP consumed — MUST run inside the provisioning transaction. */
-  consumeInTransaction(tx: Prisma.TransactionClient, otpId: string): Promise<OtpCode> {
-    return tx.otpCode.update({ where: { id: otpId }, data: { consumedAt: new Date() } });
+  /**
+   * Marks the OTP consumed — MUST run inside the provisioning transaction.
+   * Part A hotfix #4: atomic guard (`consumedAt: null` predicate) so two
+   * concurrent verifies can never consume the same valid code twice.
+   */
+  async consumeInTransaction(tx: Prisma.TransactionClient, otpId: string): Promise<void> {
+    const result = await tx.otpCode.updateMany({
+      where: { id: otpId, consumedAt: null },
+      data: { consumedAt: new Date() },
+    });
+    if (result.count !== 1) {
+      throw new BadRequestException({
+        statusCode: 400,
+        message: 'این کد تأیید قبلاً استفاده شده است؛ کد جدید درخواست کنید.',
+      });
+    }
   }
 
   private hashCode(code: string, salt: string): string {

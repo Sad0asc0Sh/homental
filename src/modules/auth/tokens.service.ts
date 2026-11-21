@@ -91,6 +91,15 @@ export class TokensService {
       });
     }
 
+    // Part A hotfix #2: suspended/deactivated users can never rotate tokens.
+    if (session.user.status !== 'ACTIVE') {
+      await this.revokeAllForUser(session.userId);
+      throw new UnauthorizedException({
+        statusCode: 401,
+        message: 'حساب کاربری شما فعال نیست؛ تمام نشست‌های شما باطل شد.',
+      });
+    }
+
     const newSessionId = randomUUID();
     const newRefreshToken = await this.signRefreshToken(session.userId, newSessionId);
     await this.prisma.$transaction([

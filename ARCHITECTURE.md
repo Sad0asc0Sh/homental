@@ -69,7 +69,7 @@ import core modules + infrastructure; **core modules never import verticals**.
 
 - Task 1 — Scaffold & shared infrastructure ✅
 - Task 2 — Auth, RBAC & org ✅ (phone-OTP login w/ Redis rate limits, JWT access + refresh rotation with reuse-detection revocation, `@Public`/`@Roles`/`@CurrentUser` + `JwtAuthGuard`/`RolesGuard`, users & addresses, branch-scoped admin technicians, cities/branches admin CRUD with role-restricted fields, notifications core + pluggable SMS provider)
-- Task 3 — Catalog & Advisory engine (public `uiSchema` API, SecurityProfile, facts builder, JSON-Logic scoring)
+- Task 3 — Catalog & Advisory engine ✅ (`GET /api/v1/catalog/schemas` grouped under the 3 pillars w/ Persian metadata + `recommendedPreset` dual-path entry, `locationType` filtering of fields/goal-cards, admin CRUD with Zod-validated JSONB + auto version bump; `POST /api/v1/advisor/evaluate` guest engine: facts builder merges `pricingSchema.variables` defaults under user answers, location-weighted 0–100 pillar scoring w/ Persian tiers, JSON-Logic rule engine (max 2, priority-ordered, one-click `APPLY_SERVICE_CONFIG`), customer SecurityProfiles, admin rules CRUD with `validateLogic` dry-run)
 - Task 4 — Dynamic pricing engine (interpreter, supplyMode, surge, urgency, bundles, transparent breakdown)
 - Task 5 — Orders, state machine & escrow (transitions, audit, escrow hold/release, BRANCH_QUEUE)
 - Task 6 — Dispatch, realtime & warranty lock (GEO sync, weighted scoring, 30s offers + locks, handover gate, reviews, e2e)

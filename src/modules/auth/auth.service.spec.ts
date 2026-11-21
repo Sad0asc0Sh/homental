@@ -20,7 +20,7 @@ const fakeUser = {
 } as User;
 
 interface TxMock {
-  user: { upsert: jest.Mock };
+  user: { upsert: jest.Mock; findUnique: jest.Mock };
   customerProfile: { upsert: jest.Mock };
   wallet: { upsert: jest.Mock };
   otpCode: { update: jest.Mock };
@@ -30,7 +30,7 @@ function buildService() {
   const otpService = {
     request: jest.fn().mockResolvedValue({ sent: true }),
     assertConsumable: jest.fn().mockResolvedValue({ id: 'otp1' }),
-    consumeInTransaction: jest.fn().mockResolvedValue({}),
+    consumeInTransaction: jest.fn().mockResolvedValue(undefined),
   } as unknown as OtpService;
   const tokensService = {
     issueTokenPair: jest
@@ -39,7 +39,10 @@ function buildService() {
   } as unknown as TokensService;
 
   const tx: TxMock = {
-    user: { upsert: jest.fn().mockResolvedValue(fakeUser) },
+    user: {
+      findUnique: jest.fn().mockResolvedValue(null), // new user by default
+      upsert: jest.fn().mockResolvedValue(fakeUser),
+    },
     customerProfile: { upsert: jest.fn().mockResolvedValue({}) },
     wallet: { upsert: jest.fn().mockResolvedValue({}) },
     otpCode: { update: jest.fn().mockResolvedValue({}) },
@@ -105,5 +108,33 @@ describe('AuthService.verifyOtp — atomic provisioning (Part B #3)', () => {
     (otpService.request as jest.Mock).mockResolvedValue({ sent: true });
     await expect(service.requestOtp(PHONE)).resolves.toEqual({ sent: true });
     expect(otpService.request).toHaveBeenCalledWith(PHONE);
+  });
+
+  // ── Part A hotfix #2: suspended/deactivated users can never log in ─────────
+
+  it.each(['SUSPENDED', 'DEACTIVATED'] as const)(
+    'blocks a %s user at verify with 403 and issues NO tokens',
+    async (status) => {
+      const { service, tx, tokensService } = buildService();
+      (tx.user.findUnique as jest.Mock).mockResolvedValue({ id: 'u1', status });
+
+      await expect(service.verifyOtp(PHONE, '123456')).rejects.toThrow(/مسدود یا غیرفعال/);
+      expect(tx.user.upsert).not.toHaveBeenCalled();
+      expect(tokensService.issueTokenPair).not.toHaveBeenCalled();
+    },
+  );
+
+  it('activates a PENDING_VERIFICATION user on successful verify', async () => {
+    const { service, tx } = buildService();
+    (tx.user.findUnique as jest.Mock).mockResolvedValue({
+      id: 'u1',
+      phone: PHONE,
+      status: 'PENDING_VERIFICATION',
+    });
+
+    await service.verifyOtp(PHONE, '123456');
+    expect(tx.user.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ update: { status: 'ACTIVE' } }),
+    );
   });
 });

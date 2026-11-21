@@ -36,6 +36,7 @@
     "dotenv": "^16.4.5",
     "helmet": "^8.0.0",
     "ioredis": "^5.4.1",
+    "json-logic-js": "^2.0.5",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
     "zod": "^3.25.0"
@@ -47,6 +48,7 @@
     "@nestjs/testing": "^11.0.0",
     "@types/express": "^5.0.0",
     "@types/jest": "^29.5.14",
+    "@types/json-logic-js": "^2.0.7",
     "@types/node": "^22.10.0",
     "eslint": "^9.20.0",
     "eslint-config-prettier": "^10.0.1",

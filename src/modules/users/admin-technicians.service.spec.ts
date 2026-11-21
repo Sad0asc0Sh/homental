@@ -27,7 +27,7 @@ const superAdmin = {
 const activeBranch = { id: 'b1', code: 'MSHD-C1', isActive: true };
 
 interface TxMock {
-  user: { upsert: jest.Mock };
+  user: { upsert: jest.Mock; findUnique: jest.Mock };
   technicianProfile: { upsert: jest.Mock };
   wallet: { upsert: jest.Mock };
 }
@@ -35,6 +35,7 @@ interface TxMock {
 function buildService() {
   const tx: TxMock = {
     user: {
+      findUnique: jest.fn().mockResolvedValue(null), // new user by default
       upsert: jest.fn().mockResolvedValue({
         id: 'u9',
         phone: '+989121111111',
@@ -144,5 +145,83 @@ describe('AdminTechniciansService — cross-branch isolation (Part B #4)', () =>
     expect(prisma.technicianProfile.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: { branchId: 'b2' } }),
     );
+  });
+
+  // ── Part A hotfix #1: role overwrite & hijack protection ───────────────────
+
+  it('rejects with 409 when the phone belongs to a SUPER_ADMIN (role overwrite)', async () => {
+    const { service, tx } = buildService();
+    (tx.user.findUnique as jest.Mock).mockResolvedValue({
+      id: 'sa1',
+      phone: '+989120000001',
+      role: UserRole.SUPER_ADMIN,
+      technicianProfile: null,
+    });
+
+    await expect(
+      service.create(branchAdminA, {
+        phone: '09120000001',
+        branchId: 'b1',
+        skills: ['CCTV'],
+      }),
+    ).rejects.toThrow(/مدیر/);
+    expect(tx.user.upsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects with 409 when the phone belongs to another BRANCH_ADMIN', async () => {
+    const { service, tx } = buildService();
+    (tx.user.findUnique as jest.Mock).mockResolvedValue({
+      id: 'adminB',
+      role: UserRole.BRANCH_ADMIN,
+      technicianProfile: null,
+    });
+    await expect(
+      service.create(branchAdminA, { phone: '09120000003', branchId: 'b1', skills: ['ALARM'] }),
+    ).rejects.toThrow(/مدیر/);
+    expect(tx.user.upsert).not.toHaveBeenCalled();
+  });
+
+  it('BRANCH_ADMIN cannot steal (re-branch) a technician of ANOTHER branch', async () => {
+    const { service, tx } = buildService();
+    (tx.user.findUnique as jest.Mock).mockResolvedValue({
+      id: 'u2',
+      role: UserRole.TECHNICIAN,
+      technicianProfile: { id: 'tp2', branchId: 'b2' },
+    });
+
+    await expect(
+      service.create(branchAdminA, { phone: '09122222222', branchId: 'b1', skills: ['CCTV'] }),
+    ).rejects.toThrow(/انتقال تکنسین/);
+    expect(tx.technicianProfile.upsert).not.toHaveBeenCalled();
+  });
+
+  it('only SUPER_ADMIN may transfer an existing technician across branches', async () => {
+    const { service, tx } = buildService();
+    (tx.user.findUnique as jest.Mock).mockResolvedValue({
+      id: 'u2',
+      role: UserRole.TECHNICIAN,
+      technicianProfile: { id: 'tp2', branchId: 'b2' },
+    });
+
+    await service.create(superAdmin, {
+      phone: '09122222222',
+      branchId: 'b1',
+      skills: ['CCTV'],
+    });
+    expect(tx.technicianProfile.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({ branchId: 'b1' }),
+      }),
+    );
+  });
+
+  // ── Part A hotfix #3: unassigned BRANCH_ADMIN sees NOTHING ─────────────────
+
+  it('an unassigned BRANCH_ADMIN (branchId null) gets an empty list, never all technicians', async () => {
+    const { service, prisma } = buildService();
+    const unassigned: AuthenticatedUser = { ...branchAdminA, branchId: null };
+    const result = await service.list(unassigned, { page: 1, limit: 10 });
+    expect(result).toEqual({ items: [], total: 0, page: 1, limit: 10 });
+    expect(prisma.technicianProfile.findMany).not.toHaveBeenCalled();
   });
 });

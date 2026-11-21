@@ -7,10 +7,11 @@ import { JwtConfigModule } from '@modules/auth/jwt-config.module';
 import { CitiesBranchesModule } from '@modules/cities-branches/cities-branches.module';
 import { HealthModule } from '@modules/health/health.module';
 import { NotificationsModule } from '@modules/notifications/notifications.module';
+import { SecurityServicesModule } from '@modules/security-services/security-services.module';
 import { UsersModule } from '@modules/users/users.module';
 
-// Core modules ONLY in the root — the security-services vertical joins in
-// Task 3+. Core never imports verticals (ARCHITECTURE.md Invariant 11).
+// Core modules first, verticals last. Core never imports verticals
+// (ARCHITECTURE.md Invariant 11).
 @Module({
   imports: [
     AppConfigModule,
@@ -22,6 +23,7 @@ import { UsersModule } from '@modules/users/users.module';
     AuthModule,
     UsersModule,
     CitiesBranchesModule,
+    SecurityServicesModule,
   ],
 })
 export class AppModule {}

@@ -83,7 +83,12 @@ describe('OtpService — request rate limiting (Part B #3)', () => {
 describe('OtpService — assertConsumable (Part B #3 verify flow)', () => {
   function buildVerifiedService() {
     const prisma = {
-      otpCode: { create: jest.fn(), findFirst: jest.fn(), update: jest.fn().mockResolvedValue({}) },
+      otpCode: {
+        create: jest.fn(),
+        findFirst: jest.fn(),
+        update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
     } as unknown as PrismaService;
     const redis = { rateLimit: jest.fn() } as unknown as RedisService;
     const config = { otpTtlSeconds: 120, otpMaxAttempts: 5, otpDevEcho: false } as unknown as AppConfigService;
@@ -158,5 +163,27 @@ describe('OtpService — assertConsumable (Part B #3 verify flow)', () => {
     const { service, prisma } = buildVerifiedService();
     (prisma.otpCode.findFirst as jest.Mock).mockResolvedValue(null);
     await expect(service.assertConsumable(PHONE, '123456')).rejects.toThrow(/منقضی شده/);
+  });
+
+  // ── Part A hotfix #4: atomic OTP consumption guard ──────────────────────────
+
+  it('consumeInTransaction succeeds only when the code is consumed exactly once', async () => {
+    const { service, prisma } = buildVerifiedService();
+    (prisma.otpCode.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
+    const tx = { otpCode: { updateMany: prisma.otpCode.updateMany as jest.Mock } };
+    await expect(service.consumeInTransaction(tx as never, 'otp1')).resolves.toBeUndefined();
+    expect(prisma.otpCode.updateMany).toHaveBeenCalledWith({
+      where: { id: 'otp1', consumedAt: null },
+      data: { consumedAt: expect.any(Date) },
+    });
+  });
+
+  it('consumeInTransaction throws 400 when a concurrent verify already consumed the code', async () => {
+    const { service, prisma } = buildVerifiedService();
+    (prisma.otpCode.updateMany as jest.Mock).mockResolvedValue({ count: 0 }); // already consumed
+    const tx = { otpCode: { updateMany: prisma.otpCode.updateMany as jest.Mock } };
+    await expect(service.consumeInTransaction(tx as never, 'otp1')).rejects.toThrow(
+      /قبلاً استفاده/,
+    );
   });
 });

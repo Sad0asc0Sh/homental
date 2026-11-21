@@ -1,4 +1,10 @@
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import { normalizeIranPhone } from '@common/utils/phone.util';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
@@ -55,6 +61,31 @@ export class AdminTechniciansService {
 
     const phone = normalizeIranPhone(dto.phone);
     return this.prisma.$transaction(async (tx) => {
+      // Part A hotfix #1: never let this endpoint silently overwrite an
+      // admin account or let a branch admin hijack another branch's technician.
+      const existing = await tx.user.findUnique({
+        where: { phone },
+        include: { technicianProfile: true },
+      });
+      if (existing) {
+        if (existing.role === UserRole.SUPER_ADMIN || existing.role === UserRole.BRANCH_ADMIN) {
+          throw new ConflictException({
+            statusCode: 409,
+            message: 'تبدیل حساب مدیر (ابرادمین یا مدیر شعبه) به تکنسین از این مسیر مجاز نیست.',
+          });
+        }
+        if (
+          actor.role === UserRole.BRANCH_ADMIN &&
+          existing.technicianProfile &&
+          existing.technicianProfile.branchId !== dto.branchId
+        ) {
+          throw new ForbiddenException({
+            statusCode: 403,
+            message: 'انتقال تکنسین بین شعبه‌ها فقط توسط ابرادمین سامانه ممکن است.',
+          });
+        }
+      }
+
       const user = await tx.user.upsert({
         where: { phone },
         update: {
@@ -107,6 +138,13 @@ export class AdminTechniciansService {
   }
 
   async list(actor: AuthenticatedUser, query: ListTechniciansDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    // Part A hotfix #3: a BRANCH_ADMIN without a resolved branch must NEVER
+    // fall through to an unfiltered (all-branches) query.
+    if (actor.role === UserRole.BRANCH_ADMIN && !actor.branchId) {
+      return { items: [], total: 0, page, limit };
+    }
     const branchId =
       actor.role === UserRole.BRANCH_ADMIN ? actor.branchId : (query.branchId ?? undefined);
     const where = {
@@ -115,8 +153,6 @@ export class AdminTechniciansService {
       ...(query.skill ? { skills: { has: query.skill } } : {}),
     };
 
-    const page = query.page ?? 1;
-    const limit = query.limit ?? 20;
     const [items, total] = await Promise.all([
       this.prisma.technicianProfile.findMany({
         where,

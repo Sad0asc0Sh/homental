@@ -938,7 +938,7 @@ const allLocationTypes: LocationType[] = [
   'WAREHOUSE',
 ];
 
-const serviceDefinitions = [
+export const serviceDefinitions = [
   {
     key: ServiceKey.CCTV,
     pillar: SecurityPillar.MONITORING,
@@ -1010,7 +1010,7 @@ const serviceDefinitions = [
 //    Selected suggestions: sorted by priority ASC, max 2 returned per profile.
 // ============================================================================
 
-const advisoryRules = [
+export const advisoryRules = [
   {
     code: 'SHOP_CCTV_NO_ALARM',
     pillar: SecurityPillar.INTRUSION,
@@ -1158,7 +1158,7 @@ const advisoryRules = [
 // 5) PLATFORM CONFIGS (bundle discount, surge, urgency, escrow split, dispatch)
 // ============================================================================
 
-const platformConfigs = [
+export const platformConfigs = [
   {
     key: 'pricing.bundleDiscount',
     value: {
@@ -1564,11 +1564,16 @@ async function main() {
   console.log('   • 5 platform configs (pricing, escrow, dispatch)');
 }
 
-main()
-  .catch((e) => {
-    console.error('❌ Seed failed:', e);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+// Only execute when run directly (`prisma db seed` / ts-node) — importing the
+// exported seed constants (rules, service definitions) from tests must NOT
+// trigger a seed run against the database.
+if (require.main === module) {
+  main()
+    .catch((e) => {
+      console.error('❌ Seed failed:', e);
+      process.exit(1);
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}

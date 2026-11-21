@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable } from '@nestjs/common';
 import type { User } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import { PrismaService } from '@infra/prisma/prisma.service';
@@ -45,14 +45,23 @@ export class AuthService {
    * Verifies the OTP, then — in ONE transaction — consumes the code and
    * provisions the user: new users become role=CUSTOMER / status=ACTIVE and
    * automatically receive a CustomerProfile + CUSTOMER Wallet.
+   * Part A hotfix #2: SUSPENDED/DEACTIVATED users can never mint new tokens;
+   * PENDING_VERIFICATION users are activated on successful verify.
    */
   async verifyOtp(phone: string, code: string, deviceInfo?: string, ip?: string): Promise<AuthSession> {
     const otp = await this.otpService.assertConsumable(phone, code);
 
     const user = await this.prisma.$transaction(async (tx) => {
+      const existing = await tx.user.findUnique({ where: { phone } });
+      if (existing && (existing.status === 'SUSPENDED' || existing.status === 'DEACTIVATED')) {
+        throw new ForbiddenException({
+          statusCode: 403,
+          message: 'حساب کاربری شما مسدود یا غیرفعال است؛ برای ورود با پشتیبانی تماس بگیرید.',
+        });
+      }
       const upserted = await tx.user.upsert({
         where: { phone },
-        update: {},
+        update: existing?.status === 'PENDING_VERIFICATION' ? { status: 'ACTIVE' } : {},
         create: { phone, role: 'CUSTOMER', status: 'ACTIVE' },
       });
       await tx.customerProfile.upsert({
