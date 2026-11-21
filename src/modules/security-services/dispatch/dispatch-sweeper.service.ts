@@ -21,8 +21,16 @@ export class DispatchSweeperService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit(): void {
+    // Tests drive expireStaleOffers() explicitly — no live timer there.
+    if (process.env['NODE_ENV'] === 'test') return;
     this.intervalRef = setInterval(() => {
-      void this.expireStaleOffers();
+      // Part A: a transient DB/Redis hiccup must never crash the process
+      // with an unhandled promise rejection (Node 20+ default behavior).
+      this.expireStaleOffers().catch((error: unknown) => {
+        this.logger.error(
+          `Sweeper run failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
     }, SWEEPER_INTERVAL_MS);
     this.intervalRef.unref?.();
   }

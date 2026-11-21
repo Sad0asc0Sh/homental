@@ -51,6 +51,16 @@ export class WarrantyController {
     return this.warrantyService.completeHandover(actor, id, dto);
   }
 
+  /** Expired-OTP recovery — fresh code without deadlocking the order. */
+  @Roles(UserRole.TECHNICIAN)
+  @Post('orders/:id/resend-handover-otp')
+  async resendHandoverOtp(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return this.warrantyService.resendHandoverOtp(actor, id);
+  }
+
   @Roles(UserRole.CUSTOMER)
   @Get('warranties/me')
   async myWarranties(@CurrentUser() actor: AuthenticatedUser) {

@@ -1,6 +1,8 @@
 import {
   BadRequestException,
   ForbiddenException,
+  HttpException,
+  HttpStatus,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -11,10 +13,12 @@ import { AppConfigService } from '@config/app-config.service';
 import { NotificationsService } from '@modules/notifications/notifications.service';
 import { WalletEscrowService } from '@modules/wallet-escrow/wallet-escrow.service';
 import { PrismaService } from '@infra/prisma/prisma.service';
+import { RedisService } from '@infra/redis/redis.service';
 import { RealtimeEvent, RealtimeService } from '@infra/realtime/realtime.service';
 
 const HANDOVER_OTP_TTL_MS = 10 * 60 * 1000;
 const MAX_HANDOVER_ATTEMPTS = 3;
+const HANDOVER_RESEND_LIMIT_PER_MINUTE = 1;
 
 /**
  * Mandatory Handover Gate (Invariant 9) — ALL THREE locks must pass before
@@ -33,6 +37,7 @@ export class WarrantyService {
     private readonly notificationsService: NotificationsService,
     private readonly realtimeService: RealtimeService,
     private readonly config: AppConfigService,
+    private readonly redis: RedisService,
   ) {}
 
   // ── Step 1: hardware serials ──────────────────────────────────────────────
@@ -154,6 +159,52 @@ export class WarrantyService {
     const devHandoverOtp =
       !this.config.isProduction && this.config.otpDevEcho ? otp : undefined;
     return { orderId: order.id, state: 'HANDOVER_OTP_PENDING', devHandoverOtp };
+  }
+
+  // ── Step 2b: resend OTP (expired-code recovery — no order deadlock) ───────
+
+  async resendHandoverOtp(actor: AuthenticatedUser, orderId: string) {
+    const order = await this.requireAssignedOrder(actor, orderId, OrderState.HANDOVER_OTP_PENDING);
+    if (order.handoverAttempts >= MAX_HANDOVER_ATTEMPTS) {
+      throw new BadRequestException({
+        statusCode: 400,
+        message: 'تعداد تلاش کد تحویل به سقف مجاز رسید؛ با پشتیبانی شعبه تماس بگیرید.',
+      });
+    }
+    const rate = await this.redis.rateLimit(`handover:otp:resend:${orderId}`, HANDOVER_RESEND_LIMIT_PER_MINUTE, 60_000);
+    if (!rate.allowed) {
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.TOO_MANY_REQUESTS,
+          message: 'درخواست کد جدید بیش از حد مجاز است؛ لطفاً کمی بعد تلاش کنید.',
+          retryAfterSeconds: Math.ceil(rate.retryAfterMs / 1000),
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    const otp = String(randomInt(0, 1_000_000)).padStart(6, '0');
+    const salt = randomBytes(16).toString('hex');
+    await this.prisma.serviceOrder.update({
+      where: { id: order.id },
+      data: {
+        handoverOtpHash: `${salt}:${scryptSync(otp, salt, 32).toString('hex')}`,
+        handoverOtpExpiresAt: new Date(Date.now() + HANDOVER_OTP_TTL_MS),
+      },
+    });
+
+    await this.notificationsService.send({
+      userId: order.customerId,
+      type: 'HANDOVER_OTP',
+      channel: 'SMS',
+      titleFa: 'کد جدید تحویل سفارش',
+      bodyFa: `کد جدید تحویل سفارش ${order.orderNumber}: ${otp}`,
+      data: { orderId: order.id },
+    });
+
+    const devHandoverOtp =
+      !this.config.isProduction && this.config.otpDevEcho ? otp : undefined;
+    return { orderId: order.id, resent: true, devHandoverOtp };
   }
 
   // ── Step 3: complete handover (atomic gate → warranty + escrow) ──────────

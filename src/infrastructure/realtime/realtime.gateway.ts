@@ -24,7 +24,10 @@ interface SocketUser {
  * immediately. Every authenticated socket auto-joins `user:{userId}`;
  * `join_order` verifies visibility before joining `order:{orderId}`.
  */
-@WebSocketGateway({ namespace: '/dispatch' })
+@WebSocketGateway({
+  namespace: '/dispatch',
+  cors: { origin: true, credentials: true }, // Next.js frontend (localhost:3001) must handshake cleanly
+})
 export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private readonly logger = new Logger(RealtimeGateway.name);
 

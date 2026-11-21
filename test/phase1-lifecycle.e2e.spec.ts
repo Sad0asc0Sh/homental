@@ -604,7 +604,14 @@ describe('PHASE 1 — full lifecycle e2e (Catalog → … → Review → Claim)'
   const config = { isProduction: false, otpDevEcho: true } as unknown as AppConfigService;
   const orders = new OrdersService(prisma, pricing, walletEscrow, notifications, new EventEmitter2());
   const dispatch = new DispatchService(prisma, redis as unknown as RedisService, realtime, notifications);
-  const warranty = new WarrantyService(prisma, walletEscrow, notifications, realtime, config);
+  const warranty = new WarrantyService(
+    prisma,
+    walletEscrow,
+    notifications,
+    realtime,
+    config,
+    redis as unknown as import('@infra/redis/redis.service').RedisService,
+  );
   const reviews = new ReviewsService(prisma);
 
   // Wire submit → dispatch (same contract as @OnEvent in production).

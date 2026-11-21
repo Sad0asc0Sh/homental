@@ -170,6 +170,9 @@ function buildService(options?: {
   const notificationsService = { send: jest.fn().mockResolvedValue({}) } as unknown as NotificationsService;
   const realtimeService = { emitToOrder: jest.fn(), emitToUser: jest.fn() } as unknown as RealtimeService;
   const config = { isProduction: false, otpDevEcho: true } as unknown as AppConfigService;
+  const redis = {
+    rateLimit: jest.fn().mockResolvedValue({ allowed: true, remaining: 0, retryAfterMs: 60_000 }),
+  } as unknown as import('@infra/redis/redis.service').RedisService;
 
   const service = new WarrantyService(
     prisma,
@@ -177,6 +180,7 @@ function buildService(options?: {
     notificationsService,
     realtimeService,
     config,
+    redis,
   );
   return {
     service,
@@ -184,6 +188,7 @@ function buildService(options?: {
     walletEscrowService,
     notificationsService,
     realtimeService,
+    redis,
     warranties,
     claims,
     technicianRow,
@@ -323,6 +328,40 @@ describe('WarrantyService — complete handover (atomic warranty + escrow)', () 
     await expect(service.completeHandover(technician, 'o1', { otp: devHandoverOtp as string })).rejects.toThrow(
       /منقضی/,
     );
+  });
+
+  it('expired-OTP recovery: resend issues a FRESH code without deadlocking the order (Part A fix #3)', async () => {
+    const { service, orderRow, notificationsService } = buildService({ withSerials: true });
+    const expired = await requestFirst(service);
+    orderRow.handoverOtpExpiresAt = new Date(Date.now() - 1000);
+    await expect(service.completeHandover(technician, 'o1', { otp: expired.devHandoverOtp as string })).rejects.toThrow(
+      /منقضی/,
+    );
+
+    const resend = await service.resendHandoverOtp(technician, 'o1');
+    expect(resend).toMatchObject({ orderId: 'o1', resent: true });
+    expect(resend.devHandoverOtp).toMatch(/^\d{6}$/);
+    expect(resend.devHandoverOtp).not.toBe(expired.devHandoverOtp);
+    expect(orderRow.handoverOtpExpiresAt.getTime()).toBeGreaterThan(Date.now());
+    expect(notificationsService.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'HANDOVER_OTP', channel: 'SMS', userId: 'c1', titleFa: 'کد جدید تحویل سفارش' }),
+    );
+
+    // The fresh code completes the handover — no deadlock.
+    const result = await service.completeHandover(technician, 'o1', { otp: resend.devHandoverOtp as string });
+    expect(result.state).toBe('COMPLETED_WARRANTY_ACTIVE');
+  });
+
+  it('resend is rate-limited to 1/minute with a Persian 429', async () => {
+    const { service, redis } = buildService({ withSerials: true });
+    await service.requestHandover(technician, 'o1', {
+      defaultPasswordsChanged: true,
+      technicianAccessRevoked: true,
+    });
+    await service.resendHandoverOtp(technician, 'o1');
+    (redis.rateLimit as jest.Mock).mockResolvedValue({ allowed: false, remaining: 0, retryAfterMs: 45_000 });
+
+    await expect(service.resendHandoverOtp(technician, 'o1')).rejects.toThrow(/بیش از حد مجاز/);
   });
 });
 
