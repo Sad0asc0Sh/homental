@@ -77,6 +77,7 @@ export function parseGeoSearchResponse(raw: unknown): NearbyTechnician[] {
  */
 export class PubSubDispatcher {
   private readonly handlers = new Map<string, Set<(message: string) => void>>();
+  private readonly patternHandlers = new Map<string, Set<(channel: string, message: string) => void>>();
 
   register(channel: string, handler: (message: string) => void): void {
     let set = this.handlers.get(channel);
@@ -103,6 +104,34 @@ export class PubSubDispatcher {
 
   handlerCount(channel: string): number {
     return this.handlers.get(channel)?.size ?? 0;
+  }
+
+  // ── Pattern subscriptions (PSUBSCRIBE / pmessage) ──────────────────────────
+
+  registerPattern(pattern: string, handler: (channel: string, message: string) => void): void {
+    let set = this.patternHandlers.get(pattern);
+    if (!set) {
+      set = new Set();
+      this.patternHandlers.set(pattern, set);
+    }
+    set.add(handler);
+  }
+
+  unregisterPattern(pattern: string): number {
+    const set = this.patternHandlers.get(pattern);
+    if (!set) return 0;
+    this.patternHandlers.delete(pattern);
+    return set.size;
+  }
+
+  dispatchPattern(pattern: string, channel: string, message: string): void {
+    const set = this.patternHandlers.get(pattern);
+    if (!set) return;
+    for (const handler of set) handler(channel, message);
+  }
+
+  patternHandlerCount(pattern: string): number {
+    return this.patternHandlers.get(pattern)?.size ?? 0;
   }
 }
 
@@ -141,6 +170,13 @@ export class RedisService implements OnModuleDestroy {
     this.subscriber.on('message', (receivedChannel: string, message: string) => {
       this.pubSub.dispatch(receivedChannel, message);
     });
+    // Central 'pmessage' listener for PSUBSCRIBE patterns.
+    this.subscriber.on(
+      'pmessage',
+      (pattern: string, receivedChannel: string, message: string) => {
+        this.pubSub.dispatchPattern(pattern, receivedChannel, message);
+      },
+    );
   }
 
   // ── GEO (dispatch technician index, city-scoped) ──────────────────────────
@@ -259,6 +295,31 @@ export class RedisService implements OnModuleDestroy {
     const removed = this.pubSub.unregisterChannel(channel);
     if (removed > 0) {
       await this.subscriber.unsubscribe(channel);
+    }
+  }
+
+  /** Pattern subscription (e.g. `notifications:user:*`) for cross-instance bridges. */
+  async subscribePattern(
+    pattern: string,
+    handler: (channel: string, message: string) => void | Promise<void>,
+  ): Promise<void> {
+    const wrapped = (channel: string, message: string): void => {
+      void Promise.resolve(handler(channel, message)).catch((error: unknown) =>
+        this.logger.error(
+          `Pub/sub pattern handler for "${pattern}" failed: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+    };
+    this.pubSub.registerPattern(pattern, wrapped);
+    if (this.pubSub.patternHandlerCount(pattern) === 1) {
+      await this.subscriber.psubscribe(pattern);
+    }
+  }
+
+  async unsubscribePattern(pattern: string): Promise<void> {
+    const removed = this.pubSub.unregisterPattern(pattern);
+    if (removed > 0) {
+      await this.subscriber.punsubscribe(pattern);
     }
   }
 

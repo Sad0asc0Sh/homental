@@ -4,6 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import type { OrderState, Prisma } from '@prisma/client';
 import { UserRole } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
@@ -40,6 +41,7 @@ export class OrdersService {
     private readonly pricingService: PricingService,
     private readonly walletEscrowService: WalletEscrowService,
     private readonly notificationsService: NotificationsService,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   // ── Creation (DRAFT → ESTIMATED with full pricing snapshot) ───────────────
@@ -218,6 +220,9 @@ export class OrdersService {
       bodyFa: `سفارش ${order.orderNumber} در حال جستجوی تکنسین مناسب است.`,
       data: { orderId: order.id, state: 'SEARCHING_EXPERT' },
     });
+    // Part A: auto-kickoff the first dispatch wave without a circular DI
+    // dependency — DispatchService listens on this domain event.
+    this.eventEmitter.emit('order.searching', { orderId: order.id });
     return { orderId: order.id, state: 'SEARCHING_EXPERT' };
   }
 
@@ -288,6 +293,13 @@ export class OrdersService {
       });
     }
     const finalQuoteAmount = BigInt(dto.finalQuoteAmount);
+    // Part A hardening: a non-positive quote is never acceptable.
+    if (finalQuoteAmount <= 0n) {
+      throw new BadRequestException({
+        statusCode: 400,
+        message: 'مبلغ پیش‌فاکتور باید بزرگ‌تر از صفر باشد.',
+      });
+    }
     await this.prisma.serviceOrder.update({
       where: { id: order.id },
       data: { finalQuoteAmount },

@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Injectable,
+  InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
 import type { Prisma, WalletOwnerType, WalletTransaction } from '@prisma/client';
@@ -214,6 +215,14 @@ export class WalletEscrowService {
     }
 
     const { commissionRate, reserveRate } = await this.resolveSplitRates(db, params.branchId);
+    // Part A hardening: a misconfigured branch override must never produce a
+    // negative technician payout.
+    if (commissionRate + reserveRate > 1) {
+      throw new BadRequestException({
+        statusCode: 400,
+        message: 'مجموع نرخ کمیسیون و ذخیره گارانتی نمی‌تواند از ۱۰۰٪ بیشتر باشد.',
+      });
+    }
     const platformCommission = BigInt(
       Math.round(Number(params.totalAmount) * commissionRate),
     );
@@ -246,11 +255,17 @@ export class WalletEscrowService {
     });
 
     // 2) Platform: commission + warranty reserve (dedicated 5% ledger).
-    const platformWallet = await db.wallet.upsert({
+    // The PLATFORM wallet is provisioned by the seed — a missing wallet here
+    // means broken initialization and must fail LOUDLY, not silently heal.
+    const platformWallet = await db.wallet.findUnique({
       where: { ownerType_ownerId: { ownerType: 'PLATFORM', ownerId: PLATFORM_WALLET_OWNER_ID } },
-      update: {},
-      create: { ownerType: 'PLATFORM', ownerId: PLATFORM_WALLET_OWNER_ID },
     });
+    if (!platformWallet) {
+      throw new InternalServerErrorException({
+        statusCode: 500,
+        message: 'کیف پول پلتفرم یافت نشد؛ تنظیمات اولیه سامانه ناقص است.',
+      });
+    }
     if (platformCommission > 0n) {
       await db.wallet.update({
         where: { id: platformWallet.id },

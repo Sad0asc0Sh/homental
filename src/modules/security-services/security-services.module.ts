@@ -7,19 +7,26 @@ import { AdminAdvisoryRulesController } from './advisory/admin-advisory-rules.co
 import { AdvisoryController } from './advisory/advisory.controller';
 import { AdvisoryService } from './advisory/advisory.service';
 import { SecurityProfilesController } from './advisory/security-profiles.controller';
+import { DispatchController } from './dispatch/dispatch.controller';
+import { DispatchService } from './dispatch/dispatch.service';
+import { DispatchSweeperService } from './dispatch/dispatch-sweeper.service';
 import { OrdersController } from './orders/orders.controller';
 import { OrdersService } from './orders/orders.service';
 import { DynamicFactorsService } from './pricing/dynamic-factors.service';
 import { PricingController } from './pricing/pricing.controller';
 import { PricingSchemaInterpreter } from './pricing/pricing-schema.interpreter';
 import { PricingService } from './pricing/pricing.service';
+import { ReviewsController } from './reviews/reviews.controller';
+import { ReviewsService } from './reviews/reviews.service';
+import { AdminWarrantyClaimsController } from './warranty/admin-warranty-claims.controller';
+import { WarrantyController } from './warranty/warranty.controller';
+import { WarrantyService } from './warranty/warranty.service';
 import { JsonLogicEvaluator } from './shared/json-logic.evaluator';
 
 /**
  * The Phase-1 vertical (ARCHITECTURE.md Invariant 11): may import core
  * modules (WalletEscrowModule) and infrastructure, but core modules never
- * import this. PricingService and OrdersService are exported for Task 6
- * (Dispatch, Handover Gate & Warranty).
+ * import this. Dispatch/Handover/Warranty complete the Snapp-like lifecycle.
  */
 @Module({
   imports: [WalletEscrowModule],
@@ -31,6 +38,10 @@ import { JsonLogicEvaluator } from './shared/json-logic.evaluator';
     AdminAdvisoryRulesController,
     PricingController,
     OrdersController,
+    DispatchController,
+    WarrantyController,
+    AdminWarrantyClaimsController,
+    ReviewsController,
   ],
   providers: [
     JsonLogicEvaluator,
@@ -40,7 +51,11 @@ import { JsonLogicEvaluator } from './shared/json-logic.evaluator';
     DynamicFactorsService,
     PricingService,
     OrdersService,
+    DispatchService,
+    DispatchSweeperService,
+    WarrantyService,
+    ReviewsService,
   ],
-  exports: [JsonLogicEvaluator, CatalogService, AdvisoryService, PricingService, OrdersService],
+  exports: [JsonLogicEvaluator, CatalogService, AdvisoryService, PricingService, OrdersService, DispatchService],
 })
 export class SecurityServicesModule {}

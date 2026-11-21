@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import { AppConfigModule } from '@config/app-config.module';
 import { PrismaModule } from '@infra/prisma/prisma.module';
+import { RealtimeModule } from '@infra/realtime/realtime.module';
 import { RedisModule } from '@infra/redis/redis.module';
 import { AuthModule } from '@modules/auth/auth.module';
 import { JwtConfigModule } from '@modules/auth/jwt-config.module';
@@ -18,6 +20,8 @@ import { WalletEscrowModule } from '@modules/wallet-escrow/wallet-escrow.module'
     AppConfigModule,
     PrismaModule,
     RedisModule,
+    RealtimeModule,
+    EventEmitterModule.forRoot(),
     JwtConfigModule,
     HealthModule,
     NotificationsModule,

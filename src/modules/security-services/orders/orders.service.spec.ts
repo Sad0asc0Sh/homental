@@ -1,4 +1,5 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { UserRole } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import type { PrismaService } from '@infra/prisma/prisma.service';
@@ -110,6 +111,7 @@ function buildService(orderFixture?: OrderRow) {
     pricingService as unknown as import('../pricing/pricing.service').PricingService,
     walletEscrowService as unknown as import('@modules/wallet-escrow/wallet-escrow.service').WalletEscrowService,
     notificationsService as unknown as import('@modules/notifications/notifications.service').NotificationsService,
+    new EventEmitter2(),
   );
   return { service, prisma, pricingService, walletEscrowService, notificationsService, setCurrentOrder: (o: OrderRow | null) => { currentOrder = o; } };
 }
