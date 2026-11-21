@@ -83,12 +83,14 @@ export class DynamicFactorsService {
 
   async getSurge(params: { citySlug?: string; lat?: number; lng?: number }): Promise<SurgeFactor> {
     const config = { ...DEFAULT_SURGE, ...(await this.getConfig<SurgeConfig>('pricing.surge', DEFAULT_SURGE)) };
+    // Resolve the city ONCE so Redis GEO and Postgres stay consistent even
+    // when the caller omitted citySlug (defaults to the pilot city).
     const citySlug = params.citySlug ?? DEFAULT_CITY_SLUG;
 
     const pendingOrders = await this.prisma.serviceOrder.count({
       where: {
         state: { in: [...PENDING_DISPATCH_STATES] },
-        ...(params.citySlug ? { address: { city: { slug: params.citySlug } } } : {}),
+        address: { city: { slug: citySlug } },
       },
     });
 
@@ -119,16 +121,7 @@ export class DynamicFactorsService {
       };
     }
 
-    // Demand/supply ratio. Zero online technicians with pending demand is the
-    // MOST scarce situation → treat as Infinity (clamps to the trust cap);
-    // zero demand with zero techs is simply calm.
-    const ratio =
-      activeTechs > 0
-        ? pendingOrders / activeTechs
-        : pendingOrders > 0
-          ? Number.POSITIVE_INFINITY
-          : 0;
-    const multiplier = this.clampSurge(ratio, config);
+    const multiplier = this.computeSurgeMultiplier(activeTechs, pendingOrders, config);
     return {
       multiplier,
       activeTechs,
@@ -137,18 +130,26 @@ export class DynamicFactorsService {
     };
   }
 
-  private clampSurge(ratio: number, config: SurgeConfig): number {
-    let multiplier: number;
-    if (!Number.isFinite(ratio)) {
-      multiplier = config.maxMultiplier; // unmet demand, no supply → cap
-    } else if (ratio <= config.scarceRatio) {
-      multiplier = config.maxMultiplier;
-    } else if (ratio >= config.balancedRatio) {
-      multiplier = config.minMultiplier;
-    } else {
-      const position = (ratio - config.scarceRatio) / (config.balancedRatio - config.scarceRatio);
-      multiplier = config.minMultiplier + (config.maxMultiplier - config.minMultiplier) * position;
-    }
+  /**
+   * Supply/Demand surge (Part A hotfix — the previous implementation inverted
+   * the clamp and charged max surge on an idle market). The ratio is
+   * `activeTechs / pendingOrders`, matching the seed config comment:
+   *   ratio ≥ balanced (1.0) → plenty of supply → min multiplier (calm)
+   *   ratio ≤ scarce (0.4)  → heavy load     → max multiplier (trust cap)
+   * Zero pending orders is always calm; demand with zero online technicians
+   * is the most scarce situation → cap.
+   */
+  private computeSurgeMultiplier(activeTechs: number, pendingOrders: number, config: SurgeConfig): number {
+    if (pendingOrders <= 0) return config.minMultiplier;
+    if (activeTechs <= 0) return config.maxMultiplier;
+
+    const supplyDemandRatio = activeTechs / pendingOrders;
+    if (supplyDemandRatio >= config.balancedRatio) return config.minMultiplier;
+    if (supplyDemandRatio <= config.scarceRatio) return config.maxMultiplier;
+
+    const scarcity =
+      (config.balancedRatio - supplyDemandRatio) / (config.balancedRatio - config.scarceRatio);
+    const multiplier = config.minMultiplier + (config.maxMultiplier - config.minMultiplier) * scarcity;
     const clamped = Math.min(config.maxMultiplier, Math.max(config.minMultiplier, multiplier));
     return Math.round(clamped * 100) / 100;
   }

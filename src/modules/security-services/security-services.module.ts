@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { WalletEscrowModule } from '@modules/wallet-escrow/wallet-escrow.module';
 import { AdminCatalogController } from './catalog/admin-catalog.controller';
 import { CatalogController } from './catalog/catalog.controller';
 import { CatalogService } from './catalog/catalog.service';
@@ -6,6 +7,8 @@ import { AdminAdvisoryRulesController } from './advisory/admin-advisory-rules.co
 import { AdvisoryController } from './advisory/advisory.controller';
 import { AdvisoryService } from './advisory/advisory.service';
 import { SecurityProfilesController } from './advisory/security-profiles.controller';
+import { OrdersController } from './orders/orders.controller';
+import { OrdersService } from './orders/orders.service';
 import { DynamicFactorsService } from './pricing/dynamic-factors.service';
 import { PricingController } from './pricing/pricing.controller';
 import { PricingSchemaInterpreter } from './pricing/pricing-schema.interpreter';
@@ -14,11 +17,12 @@ import { JsonLogicEvaluator } from './shared/json-logic.evaluator';
 
 /**
  * The Phase-1 vertical (ARCHITECTURE.md Invariant 11): may import core
- * modules and infrastructure, but core modules never import this.
- * The shared JsonLogicEvaluator is exported so the PricingEngine reuses
- * the exact same dialect; PricingService is exported for OrdersService (Task 5).
+ * modules (WalletEscrowModule) and infrastructure, but core modules never
+ * import this. PricingService and OrdersService are exported for Task 6
+ * (Dispatch, Handover Gate & Warranty).
  */
 @Module({
+  imports: [WalletEscrowModule],
   controllers: [
     CatalogController,
     AdminCatalogController,
@@ -26,6 +30,7 @@ import { JsonLogicEvaluator } from './shared/json-logic.evaluator';
     SecurityProfilesController,
     AdminAdvisoryRulesController,
     PricingController,
+    OrdersController,
   ],
   providers: [
     JsonLogicEvaluator,
@@ -34,7 +39,8 @@ import { JsonLogicEvaluator } from './shared/json-logic.evaluator';
     PricingSchemaInterpreter,
     DynamicFactorsService,
     PricingService,
+    OrdersService,
   ],
-  exports: [JsonLogicEvaluator, CatalogService, AdvisoryService, PricingService],
+  exports: [JsonLogicEvaluator, CatalogService, AdvisoryService, PricingService, OrdersService],
 })
 export class SecurityServicesModule {}

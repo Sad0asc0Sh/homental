@@ -29,31 +29,44 @@ function buildService(options?: {
   return { service: new DynamicFactorsService(prisma, redis), prisma, redis };
 }
 
-describe('DynamicFactorsService — surge (Snapp-like supply/demand, trust cap 1.25)', () => {
-  it('balanced supply/demand → 1.0 «تعرفه عادی»', async () => {
-    const { service } = buildService({ nearbyTechs: 4, pendingOrders: 4 }); // ratio 1.0
+describe('DynamicFactorsService — surge (supply/demand, Part A hotfix scenarios)', () => {
+  it('0 pending orders, 10 active techs → 1.0 «تعرفه عادی» (idle market is NEVER surged)', async () => {
+    const { service } = buildService({ nearbyTechs: 10, pendingOrders: 0 });
     const surge = await service.getSurge({ lat: 36.3, lng: 59.6 });
     expect(surge.multiplier).toBe(1.0);
     expect(surge.reasonFa).toBe('تعرفه عادی');
   });
 
-  it('light scarcity produces a small surge strictly inside the cap', async () => {
-    const { service } = buildService({ nearbyTechs: 4, pendingOrders: 3 }); // ratio 0.75
+  it('5 pending, 10 techs (supply/demand 2.0) → 1.0', async () => {
+    const { service } = buildService({ nearbyTechs: 10, pendingOrders: 5 });
     const surge = await service.getSurge({ lat: 36.3, lng: 59.6 });
-    expect(surge.multiplier).toBeGreaterThan(1.0);
-    expect(surge.multiplier).toBeLessThan(1.25);
+    expect(surge.multiplier).toBe(1.0);
+    expect(surge.reasonFa).toBe('تعرفه عادی');
+  });
+
+  it('10 pending, 7 techs (supply/demand 0.7) → 1.13 (linear scarcity midpoint)', async () => {
+    const { service } = buildService({ nearbyTechs: 7, pendingOrders: 10 });
+    const surge = await service.getSurge({ lat: 36.3, lng: 59.6 });
+    // scarcity = (1.0 − 0.7) / (1.0 − 0.4) = 0.5 → 1 + 0.25 × 0.5 = 1.125 → 1.13
+    expect(surge.multiplier).toBe(1.13);
     expect(surge.reasonFa).toBe('تقاضای بالا در محدوده');
   });
 
-  it('extreme scarcity hits the 1.25 trust cap with the Persian cap reason', async () => {
-    const { service } = buildService({ nearbyTechs: 10, pendingOrders: 1 }); // ratio 0.1 ≤ 0.4
+  it('10 pending, 4 techs (supply/demand 0.4) → 1.25 trust cap', async () => {
+    const { service } = buildService({ nearbyTechs: 4, pendingOrders: 10 });
     const surge = await service.getSurge({ lat: 36.3, lng: 59.6 });
     expect(surge.multiplier).toBe(1.25);
     expect(surge.reasonFa).toBe('اوج تقاضا (سقف ضریب 1.25)');
   });
 
-  it('zero active technicians clamps to the cap (division guard)', async () => {
-    const { service } = buildService({ nearbyTechs: 0, pendingOrders: 7 });
+  it('5 pending, 0 active techs → 1.25 trust cap (unmet demand)', async () => {
+    const { service } = buildService({ nearbyTechs: 0, pendingOrders: 5 });
+    const surge = await service.getSurge({ lat: 36.3, lng: 59.6 });
+    expect(surge.multiplier).toBe(1.25);
+  });
+
+  it('never exceeds the 1.25 trust cap for ANY input combination', async () => {
+    const { service } = buildService({ nearbyTechs: 1, pendingOrders: 3 }); // s/d = 0.33 ≤ 0.4
     const surge = await service.getSurge({ lat: 36.3, lng: 59.6 });
     expect(surge.multiplier).toBe(1.25);
   });
@@ -77,6 +90,18 @@ describe('DynamicFactorsService — surge (Snapp-like supply/demand, trust cap 1
     );
   });
 
+  it('city-scope consistency: omitted citySlug scopes BOTH Redis and Postgres to the pilot city', async () => {
+    const { service, prisma, redis } = buildService({ nearbyTechs: 2, pendingOrders: 1 });
+    await service.getSurge({ lat: 36.3, lng: 59.6 }); // no citySlug → resolved to 'mashhad'
+    expect(redis.findNearbyTechs).toHaveBeenCalledWith('mashhad', 36.3, 59.6, 3000, 100);
+    expect(prisma.serviceOrder.count).toHaveBeenCalledWith({
+      where: {
+        state: { in: ['SEARCHING_EXPERT', 'BRANCH_QUEUE'] },
+        address: { city: { slug: 'mashhad' } },
+      },
+    });
+  });
+
   it('degrades gracefully to 1.0 when Redis is unreachable (guest quote never crashes)', async () => {
     const { service, prisma } = buildService({ redisError: true, pendingOrders: 5 });
     const surge = await service.getSurge({ citySlug: 'mashhad', lat: 36.3, lng: 59.6 });
@@ -84,17 +109,6 @@ describe('DynamicFactorsService — surge (Snapp-like supply/demand, trust cap 1
     expect(surge.redisDegraded).toBe(true);
     expect(surge.pendingOrders).toBe(5);
     expect(prisma.serviceOrder.count).toHaveBeenCalled();
-  });
-
-  it('scopes pending orders by city when citySlug is provided', async () => {
-    const { service, prisma } = buildService({ pendingOrders: 0 });
-    await service.getSurge({ citySlug: 'mashhad', lat: 36.3, lng: 59.6 });
-    expect(prisma.serviceOrder.count).toHaveBeenCalledWith({
-      where: {
-        state: { in: ['SEARCHING_EXPERT', 'BRANCH_QUEUE'] },
-        address: { city: { slug: 'mashhad' } },
-      },
-    });
   });
 });
 

@@ -9,6 +9,7 @@ import { HealthModule } from '@modules/health/health.module';
 import { NotificationsModule } from '@modules/notifications/notifications.module';
 import { SecurityServicesModule } from '@modules/security-services/security-services.module';
 import { UsersModule } from '@modules/users/users.module';
+import { WalletEscrowModule } from '@modules/wallet-escrow/wallet-escrow.module';
 
 // Core modules first, verticals last. Core never imports verticals
 // (ARCHITECTURE.md Invariant 11).
@@ -23,6 +24,7 @@ import { UsersModule } from '@modules/users/users.module';
     AuthModule,
     UsersModule,
     CitiesBranchesModule,
+    WalletEscrowModule,
     SecurityServicesModule,
   ],
 })
