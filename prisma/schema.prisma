@@ -1,0 +1,681 @@
+// ============================================================================
+// Homental — Modular Monolith for Security & Peace-of-Mind Services
+// Pilot city: Mashhad | Phase 1: Smart Security Advisor & Snapp-like Dispatch
+// ----------------------------------------------------------------------------
+// Conventions:
+//  - Money: BigInt Toman (1 unit = 1 Toman), never floats.
+//  - Geo:   Decimal lat/lng for persistence + PostGIS `geography(Point,4326)`
+//           columns (Unsupported) kept in sync by the application/migrations.
+//           Runtime geo-matching (dispatch) lives in Redis GEO, not Postgres.
+//  - Copy:  ALL customer-facing labels/messages live in JSONB in Persian (fa).
+//  - Rules: Advisory + pricing formulas are JSON-Logic documents in DB rows.
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis]
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum UserRole {
+  CUSTOMER
+  TECHNICIAN
+  BRANCH_ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum TechnicianStatus {
+  PENDING_APPROVAL
+  APPROVED
+  SUSPENDED
+}
+
+enum OtpPurpose {
+  LOGIN
+  PHONE_VERIFY
+}
+
+enum LocationType {
+  APARTMENT
+  VILLA
+  SHOP
+  PARKING
+  WAREHOUSE
+}
+
+enum SecurityPillar {
+  PHYSICAL
+  INTRUSION
+  MONITORING
+}
+
+enum ServiceKey {
+  ELECTRIC_SHUTTER
+  PARKING_JACK
+  ALARM
+  CCTV
+}
+
+enum OrderState {
+  DRAFT
+  ESTIMATED
+  SEARCHING_EXPERT
+  EXPERT_ASSIGNED
+  ON_THE_WAY
+  INSPECTING
+  QUOTE_APPROVED
+  IN_PROGRESS
+  HANDOVER_OTP_PENDING
+  COMPLETED_WARRANTY_ACTIVE
+  CANCELLED
+  BRANCH_QUEUE
+}
+
+enum SupplyMode {
+  FULL_PACKAGE // hardware + labor (customer buys through platform)
+  INSTALL_ONLY // customer-provided hardware, labor only
+}
+
+enum UrgencyLevel {
+  SCHEDULED
+  SAME_DAY
+  EMERGENCY
+}
+
+enum DispatchOfferStatus {
+  PENDING // 30s websocket offer is live (Redis lock held)
+  ACCEPTED
+  DECLINED
+  EXPIRED // 30s TTL passed without response
+  CANCELLED // superseded / order cancelled
+}
+
+enum WalletOwnerType {
+  CUSTOMER
+  TECHNICIAN
+  BRANCH
+  PLATFORM
+}
+
+enum WalletTransactionType {
+  TOPUP
+  ESCROW_HOLD
+  ESCROW_RELEASE
+  PLATFORM_COMMISSION
+  WARRANTY_RESERVE // dedicated 5% ledger held until warranty ends
+  TECHNICIAN_PAYOUT
+  BRANCH_PAYOUT
+  REFUND
+  ADJUSTMENT
+}
+
+enum WalletTransactionStatus {
+  PENDING
+  SETTLED
+  FAILED
+  REVERSED
+}
+
+enum NotificationChannel {
+  IN_APP
+  SMS
+  PUSH
+  SOCKET
+}
+
+enum NotificationType {
+  ORDER_STATUS_CHANGED
+  DISPATCH_OFFER
+  HANDOVER_OTP
+  WARRANTY_ACTIVATED
+  WALLET_EVENT
+  ADVISORY_RESULT
+  WARRANTY_CLAIM
+  GENERIC
+}
+
+enum WarrantyStatus {
+  ACTIVE
+  IN_CLAIM
+  EXPIRED
+  VOIDED // e.g. privacy checklist falsified / tampered hardware
+}
+
+enum WarrantyClaimStatus {
+  OPEN
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  RESOLVED
+}
+
+// ============================================================================
+// CORE: AUTH & IDENTITY
+// ============================================================================
+
+model User {
+  id        String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone     String     @unique // E.164, e.g. +989123456789 — OTP login identifier
+  firstName String?
+  lastName  String?
+  role      UserRole
+  status    UserStatus @default(PENDING_VERIFICATION)
+  avatarUrl String?
+  lastSeenAt DateTime? @updatedAt
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  customerProfile    CustomerProfile?
+  technicianProfile  TechnicianProfile?
+  branchAdminFor     Branch?               @relation("BranchAdmin")
+  notifications      Notification[]
+  orders             ServiceOrder[]        @relation("CustomerOrders")
+  assignedOrders     ServiceOrder[]        @relation("TechnicianOrders")
+  stateTransitions   OrderStateTransition[]
+  reviews            Review[]              @relation("ReviewAuthor")
+  otpCodes           OtpCode[]             @relation("UserOtpCodes")
+  refreshSessions    RefreshSession[]
+
+  @@index([role, status])
+  @@index([status, createdAt])
+}
+
+model OtpCode {
+  id         String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone      String
+  codeHash   String // bcrypt/argon2 of the 6-digit code — never store plain
+  purpose    OtpPurpose @default(LOGIN)
+  expiresAt  DateTime // short TTL (2 min)
+  attempts   Int        @default(0)
+  consumedAt DateTime?
+  userId     String?    @db.Uuid
+  user       User?      @relation("UserOtpCodes", fields: [userId], references: [id], onDelete: SetNull)
+  createdAt  DateTime   @default(now())
+
+  @@index([phone, createdAt])
+  @@index([userId])
+}
+
+model RefreshSession {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String    @db.Uuid
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique // sha256 of refresh token
+  deviceInfo String? // UA / device label shown in "active sessions"
+  ip         String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId, expiresAt])
+}
+
+model CustomerProfile {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @unique @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  addresses        Address[]
+  securityProfiles SecurityProfile[]
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model TechnicianProfile {
+  id                 String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId             String           @unique @db.Uuid
+  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branchId           String?          @db.Uuid
+  branch             Branch?          @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  status             TechnicianStatus @default(PENDING_APPROVAL)
+  skills             ServiceKey[] // dispatch skill-matching source (GIN-indexed via migration)
+  rating             Decimal          @default(0) @db.Decimal(3, 2) // 0.00 – 5.00, denormalized from Review
+  ratingCount        Int              @default(0)
+  completedJobs      Int              @default(0)
+  warrantyClaimRate  Decimal          @default(0) @db.Decimal(5, 4) // 0.0000 – 1.0000, low = better dispatch score
+  isOnline           Boolean          @default(false) // mirrored in Redis GEO index when online
+  isAcceptingOffers  Boolean          @default(true)
+  lastKnownLat       Decimal?         @db.Decimal(9, 6)
+  lastKnownLng       Decimal?         @db.Decimal(10, 6)
+  lastLocationAt     DateTime?
+  /// PostGIS mirror of lastKnown coordinates; runtime matching uses Redis GEO.
+  location           Unsupported("geography(Point,4326)")?
+  identityCardUrl    String?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  dispatchOffers DispatchOffer[]
+
+  @@index([branchId])
+  @@index([status, isOnline, isAcceptingOffers])
+  @@index([skills])
+}
+
+// ============================================================================
+// CORE: CITIES & BRANCHES (multi-city expansion ready)
+// ============================================================================
+
+model City {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug        String  @unique // "mashhad"
+  nameFa      String // "مشهد"
+  nameEn      String // "Mashhad"
+  isActive    Boolean @default(true)
+  launchOrder Int     @default(0) // rollout sequencing for future cities
+  centerLat   Decimal @db.Decimal(9, 6)
+  centerLng   Decimal @db.Decimal(10, 6)
+  branches    Branch[]
+  addresses   Address[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Branch {
+  id                  String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code                String  @unique // "MSHD-C1" — human-readable reference
+  cityId              String  @db.Uuid
+  city                City    @relation(fields: [cityId], references: [id])
+  adminId             String? @unique @db.Uuid
+  admin               User?   @relation("BranchAdmin", fields: [adminId], references: [id], onDelete: SetNull)
+  nameFa              String
+  addressFa           String
+  phone               String?
+  lat                 Decimal @db.Decimal(9, 6)
+  lng                 Decimal @db.Decimal(10, 6)
+  /// PostGIS point — kept in sync by the application; GIST-indexed via migration.
+  location            Unsupported("geography(Point,4326)")?
+  serviceRadiusMeters Int     @default(15000)
+  isActive            Boolean @default(true)
+  technicians         TechnicianProfile[]
+  wallet              Wallet?
+  orders              ServiceOrder[]
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([cityId, isActive])
+}
+
+model Address {
+  id            String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId    String          @db.Uuid
+  customer      CustomerProfile @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  cityId        String          @db.Uuid
+  city          City            @relation(fields: [cityId], references: [id])
+  titleFa       String // "خانه", "مغازه"
+  locationType  LocationType
+  fullAddressFa String
+  postalCode    String?
+  lat           Decimal         @db.Decimal(9, 6)
+  lng           Decimal         @db.Decimal(10, 6)
+  isDefault     Boolean         @default(false)
+  securityProfiles SecurityProfile[]
+  orders        ServiceOrder[]
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@index([customerId])
+  @@index([cityId, locationType])
+}
+
+// ============================================================================
+// CORE: WALLET & ESCROW (platform commission + 5% warranty reserve ledger)
+// ============================================================================
+
+model Wallet {
+  id           String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ownerType    WalletOwnerType
+  ownerId      String              @db.Uuid // polymorphic: User.id or Branch.id (PLATFORM uses a fixed constant)
+  balance      BigInt              @default(0) // spendable amount
+  heldInEscrow BigInt              @default(0) // locked for active orders
+  currency     String              @default("TOMAN")
+  transactions WalletTransaction[]
+  branchId     String?             @unique @db.Uuid
+  branch       Branch?             @relation(fields: [branchId], references: [id])
+
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  @@unique([ownerType, ownerId])
+  @@index([ownerType])
+}
+
+model WalletTransaction {
+  id             String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  walletId       String                 @db.Uuid
+  wallet         Wallet                 @relation(fields: [walletId], references: [id])
+  orderId        String?                @db.Uuid
+  order          ServiceOrder?          @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  type           WalletTransactionType
+  status         WalletTransactionStatus @default(SETTLED)
+  amount         BigInt // signed: + credit / - debit
+  balanceAfter   BigInt // running balance snapshot for auditability
+  description    String?
+  idempotencyKey String?                @unique // prevents double escrow release / payout
+  metadata       Json? // e.g. { commissionRate: 0.15, warrantyReserveRate: 0.05 }
+  createdAt      DateTime               @default(now())
+
+  @@index([walletId, createdAt])
+  @@index([orderId])
+  @@index([type, status])
+}
+
+// ============================================================================
+// CORE: NOTIFICATIONS
+// ============================================================================
+
+model Notification {
+  id        String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String              @db.Uuid
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  channel   NotificationChannel @default(IN_APP)
+  titleFa   String
+  bodyFa    String
+  data      Json? // deep-link payload, e.g. { orderId, state }
+  readAt    DateTime?
+  sentAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+}
+
+// ============================================================================
+// CORE: SCHEMA-DRIVEN PLATFORM CONFIG (no magic numbers in code)
+// ============================================================================
+
+model PlatformConfig {
+  key       String   @unique // "pricing.bundleDiscount", "dispatch.offer", "escrow.split", ...
+  value     Json // JSON document interpreted by the relevant engine
+  updatedAt DateTime @updatedAt
+  updatedBy String?  @db.Uuid
+}
+
+// ============================================================================
+// VERTICAL: SECURITY SERVICES — CATALOG (100% schema-driven)
+// ============================================================================
+
+model ServiceDefinition {
+  id                     String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key                    ServiceKey      @unique
+  pillar                 SecurityPillar
+  version                Int             @default(1) // bumped on ui/pricing schema change
+  titleFa                String
+  subtitleFa             String?
+  descriptionFa          String?
+  iconKey                String?
+  displayOrder           Int             @default(0)
+  supportedLocationTypes LocationType[]
+  baseReadinessScore     Int             @default(0) // advisory engine: pillar points when service active
+  warrantyMonths         Int             @default(12)
+  typicalDurationMinutes Int             @default(120)
+  uiSchema               Json // steps/steppers/chips/switches + goal cards — all labels fa
+  pricingSchema          Json // hardware + labor + dispatch, JSON-Logic quantities/formulas
+  isActive               Boolean         @default(true)
+  orderItems             OrderItem[]
+  createdAt              DateTime        @default(now())
+  updatedAt              DateTime        @updatedAt
+
+  @@index([pillar, isActive])
+  @@index([isActive, displayOrder])
+}
+
+// ============================================================================
+// VERTICAL: ADVISORY & SECURITY READINESS (JSON-Logic rules)
+// ============================================================================
+
+model AdvisoryRule {
+  id                     String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code                   String           @unique // "SHOP_CCTV_NO_ALARM"
+  pillar                 SecurityPillar // primary pillar the suggestion impacts
+  priority               Int              @default(100) // lower = wins when selecting top-2 suggestions
+  appliesToLocationTypes LocationType[]
+  condition              Json // JSON-Logic over SecurityProfile facts
+  suggestedActionFa      String // natural Persian, customer-facing
+  suggestedServiceKey    ServiceKey?
+  suggestedConfig        Json? // recommended config snippet, e.g. { "nightPlate": true }
+  scoreImpact            Json // pillar deltas, e.g. { "intrusion": 30 }
+  isActive               Boolean          @default(true)
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+
+  @@index([isActive, priority])
+}
+
+model SecurityProfile {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId      String          @db.Uuid
+  customer        CustomerProfile @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  addressId       String          @db.Uuid
+  address         Address         @relation(fields: [addressId], references: [id])
+  titleFa         String? // "منزل", "مغازه"
+  locationType    LocationType
+  buildingContext Json? // facts for advisory: { unitsCount, floorsCount, hasGuard, ... }
+  servicesConfig  Json // answers per service: { CCTV: {...}, ALARM: {...} }
+  readinessScore  Json? // { physical, intrusion, monitoring, total } 0–100
+  lastEvaluatedAt DateTime?
+  orders          ServiceOrder[]
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([customerId])
+  @@index([locationType])
+}
+
+// ============================================================================
+// VERTICAL: ORDERS — STRICT STATE MACHINE
+// ============================================================================
+// DRAFT -> ESTIMATED -> SEARCHING_EXPERT -> EXPERT_ASSIGNED -> ON_THE_WAY ->
+// INSPECTING -> QUOTE_APPROVED -> IN_PROGRESS -> HANDOVER_OTP_PENDING ->
+// COMPLETED_WARRANTY_ACTIVE   (+ CANCELLED from any pre-IN_PROGRESS state,
+//  BRANCH_QUEUE when no technician is found within max radius)
+// ============================================================================
+
+model ServiceOrder {
+  id                    String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderNumber           String         @unique // "HM-2026-000001"
+  customerId            String         @db.Uuid
+  customer              User           @relation("CustomerOrders", fields: [customerId], references: [id])
+  technicianId          String?        @db.Uuid
+  technician            User?          @relation("TechnicianOrders", fields: [technicianId], references: [id], onDelete: SetNull)
+  branchId              String?        @db.Uuid
+  branch                Branch?        @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  securityProfileId     String?        @db.Uuid
+  securityProfile       SecurityProfile? @relation(fields: [securityProfileId], references: [id], onDelete: SetNull)
+  addressId             String         @db.Uuid
+  address               Address        @relation(fields: [addressId], references: [id])
+  state                 OrderState     @default(DRAFT)
+  locationType          LocationType // denormalized snapshot from Address at creation time
+  urgency               UrgencyLevel   @default(SCHEDULED)
+  supplyMode            SupplyMode     @default(FULL_PACKAGE)
+  scheduledAt           DateTime?
+  items                 OrderItem[]
+  // Transparent pricing snapshot: { estimatedMin, estimatedMax, lines: [...],
+  // surge: { multiplier, reason }, urgencyMultiplier, bundleDiscountPercent }
+  pricing               Json?
+  surgeMultiplier       Decimal        @default(1) @db.Decimal(4, 2) // applies ONLY to labor+dispatch
+  urgencyMultiplier     Decimal        @default(1) @db.Decimal(3, 2) // applies ONLY to labor+dispatch
+  bundleDiscountPercent Int            @default(0) // 2 services = 6, 3+ = 10 (from PlatformConfig)
+  finalQuoteAmount      BigInt? // confirmed after INSPECTING
+  handoverOtpHash       String? // 6-digit OTP, hashed; shown to customer, entered by technician
+  handoverOtpExpiresAt  DateTime?
+  handoverAttempts      Int            @default(0) // max 3 then lock & support
+  privacyChecklistSignedAt DateTime?
+  privacyChecklistAnswers Json? // { defaultPasswordsChanged: true, technicianAccessRevoked: true }
+  cancelReason          String?
+  cancelledAt           DateTime?
+  cancelledByUserId     String?        @db.Uuid
+  completedAt           DateTime?
+  warranty              Warranty?
+  dispatchOffers        DispatchOffer[]
+  stateTransitions      OrderStateTransition[]
+  transactions          WalletTransaction[]
+  review                Review?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  @@index([customerId, createdAt])
+  @@index([technicianId, state])
+  @@index([state, createdAt])
+  @@index([branchId, state])
+}
+
+model OrderItem {
+  id                  String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId             String            @db.Uuid
+  order               ServiceOrder      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  serviceDefinitionId String            @db.Uuid
+  serviceDefinition   ServiceDefinition @relation(fields: [serviceDefinitionId], references: [id])
+  config              Json // customer answers against uiSchema of that version
+  pricingSnapshot     Json? // per-item hardware/labor lines at estimate time
+  hardwareUnits       HardwareUnit[]
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@unique([orderId, serviceDefinitionId]) // one line per service per order
+  @@index([orderId])
+  @@index([serviceDefinitionId])
+}
+
+// ============================================================================
+// VERTICAL: DISPATCH (Redis GEO + expanding radius + atomic 30s offers)
+// ============================================================================
+
+model DispatchOffer {
+  id              String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId         String               @db.Uuid
+  order           ServiceOrder         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  technicianId    String               @db.Uuid
+  technician      TechnicianProfile    @relation(fields: [technicianId], references: [id])
+  status          DispatchOfferStatus  @default(PENDING)
+  radiusMeters    Int // dispatch ring the offer was sent in
+  distanceMeters  Int? // from Redis GEO at offer time
+  score           Decimal              @db.Decimal(5, 2) // weighted total, 0–100
+  scoreBreakdown  Json // { proximity, skillMatch, rating, warrantyClaimRate } contributions
+  /// Redis lock key: dispatch:offer:{orderId}:{offerId} — SET NX PX 30000
+  lockKey         String               @unique
+  offeredAt       DateTime             @default(now())
+  expiresAt       DateTime // offeredAt + 30s (config: dispatch.offer.ttlSeconds)
+  respondedAt     DateTime?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  @@unique([orderId, technicianId]) // one offer wave per technician per order
+  @@index([orderId, status])
+  @@index([technicianId, status])
+  @@index([status, expiresAt]) // sweeper for expired-but-unresponded offers
+}
+
+// ============================================================================
+// VERTICAL: WARRANTY & HARDWARE REGISTRY
+// ============================================================================
+
+model HardwareUnit {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderItemId       String    @db.Uuid
+  orderItem         OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  categoryFa        String // "دوربین", "سنسور درب", "موتور کرکره"
+  brand             String?
+  model             String?
+  serialNumber      String    @unique // scanned/registered at handover — warranty lock
+  registeredAt      DateTime  @default(now())
+  registeredByUserId String?  @db.Uuid
+
+  @@index([orderItemId])
+}
+
+model Warranty {
+  id                   String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  policyNumber         String            @unique // "WR-2026-000001"
+  orderId              String            @unique @db.Uuid
+  order                ServiceOrder      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  startDate            DateTime          @default(now())
+  endDate              DateTime
+  status               WarrantyStatus    @default(ACTIVE)
+  coverageMonths       Int // effective months (min across items)
+  coverage             Json? // per-item terms from ServiceDefinition.warrantyMonths
+  warrantyReserveAmount BigInt? // 5% held in reserve ledger at activation
+  escrowReleasedAt     DateTime?
+  claims               WarrantyClaim[]
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  @@index([status, endDate])
+}
+
+model WarrantyClaim {
+  id               String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  warrantyId       String             @db.Uuid
+  warranty         Warranty           @relation(fields: [warrantyId], references: [id], onDelete: Cascade)
+  openedByUserId   String             @db.Uuid
+  status           WarrantyClaimStatus @default(OPEN)
+  descriptionFa    String
+  photos           Json? // [{ url, takenAt }]
+  resolutionNoteFa String?
+  resolvedAt       DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  @@index([warrantyId, status])
+}
+
+// ============================================================================
+// VERTICAL: ORDER STATE AUDIT + REVIEWS
+// ============================================================================
+
+model OrderStateTransition {
+  id          String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId     String      @db.Uuid
+  order       ServiceOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromState   OrderState?
+  toState     OrderState
+  actorUserId String?     @db.Uuid
+  actor       User?       @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorRole   UserRole?
+  reason      String?
+  metadata    Json? // e.g. { otpVerified: true, radiusMeters: 4000 }
+  createdAt   DateTime    @default(now())
+
+  @@index([orderId, createdAt])
+  @@index([toState, createdAt])
+}
+
+model Review {
+  id        String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId   String      @unique @db.Uuid
+  order     ServiceOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  authorId  String      @db.Uuid
+  author    User        @relation("ReviewAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  rating    Int // 1–5
+  commentFa String?
+  createdAt DateTime    @default(now())
+
+  @@index([authorId])
+}
+
+// ============================================================================
+// POST-MIGRATION SQL (apply manually in the first migration, after `prisma migrate dev`):
+//
+//   -- GIST indexes for geo columns (Prisma cannot create these natively)
+//   CREATE INDEX IF NOT EXISTS branches_location_gist ON "Branch" USING GIST ("location");
+//   CREATE INDEX IF NOT EXISTS technicians_location_gist ON "TechnicianProfile" USING GIST ("location");
+//
+//   -- GIN index for skill-array matching in dispatch queries
+//   CREATE INDEX IF NOT EXISTS technicians_skills_gin ON "TechnicianProfile" USING GIN ("skills");
+// ============================================================================
