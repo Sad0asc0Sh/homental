@@ -1,4 +1,4 @@
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import type { PrismaService } from '@infra/prisma/prisma.service';
@@ -177,7 +177,7 @@ describe('DispatchService — atomic single-winner accept (Invariant 5)', () => 
     expect(realtimeService.emitToUser).toHaveBeenCalledWith(
       't2',
       'OFFER_TAKEN',
-      expect.objectContaining({ orderId: 'o1', takenByAnotherExpert: true }),
+      expect.objectContaining({ orderId: 'o1', offerId: 'offer-tp-b', takenByAnotherExpert: true }),
     );
     expect(prisma.orderStateTransition.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -271,5 +271,44 @@ describe('DispatchSweeperService — expiry sweeper', () => {
     expect(prisma.serviceOrder.findUnique).toHaveBeenCalled();
     // startSearch is invoked through the sweeper for the affected order.
     expect(prisma.dispatchOffer.create).toHaveBeenCalled();
+  });
+});
+
+describe('DispatchService — getTechnicianMe', () => {
+  it('returns persisted online status, location and rating metrics', async () => {
+    const { service, prisma } = buildDispatch();
+    (prisma.technicianProfile.findUnique as jest.Mock).mockResolvedValue({
+      id: 'tp-a',
+      userId: 't1',
+      status: 'APPROVED',
+      isOnline: true,
+      isAcceptingOffers: true,
+      lastKnownLat: 36.3105,
+      lastKnownLng: 59.5663,
+      rating: 4.85,
+      ratingCount: 120,
+      completedJobs: 140,
+      warrantyClaimRate: 0.02,
+    });
+
+    const me = await service.getTechnicianMe(actorT1);
+    expect(me).toEqual({
+      technicianId: 'tp-a',
+      status: 'APPROVED',
+      isOnline: true,
+      isAcceptingOffers: true,
+      lastKnownLat: 36.3105,
+      lastKnownLng: 59.5663,
+      rating: 4.85,
+      ratingCount: 120,
+      completedJobs: 140,
+      warrantyClaimRate: 0.02,
+    });
+  });
+
+  it('throws 404 when technician profile is missing', async () => {
+    const { service, prisma } = buildDispatch();
+    (prisma.technicianProfile.findUnique as jest.Mock).mockResolvedValue(null);
+    await expect(service.getTechnicianMe(actorT1)).rejects.toThrow(NotFoundException);
   });
 });

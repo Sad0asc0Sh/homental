@@ -26,7 +26,10 @@ const NAV_BY_ROLE: Record<string, Array<{ href: string; labelFa: string }>> = {
   CUSTOMER: CUSTOMER_NAV,
   TECHNICIAN: [{ href: '/technician', labelFa: 'پنل نصاب' }],
   BRANCH_ADMIN: [{ href: '/branch', labelFa: 'پنل مدیریت شعبه' }],
-  SUPER_ADMIN: [{ href: '/branch', labelFa: 'پنل مدیریت شعبه' }],
+  SUPER_ADMIN: [
+    { href: '/admin', labelFa: 'پنل مدیریت کل' },
+    { href: '/branch', labelFa: 'پنل مدیریت شعبه' },
+  ],
 };
 
 export function AppHeader() {

@@ -47,6 +47,13 @@ export class CitiesBranchesService {
 
   // ── Admin: cities (SUPER_ADMIN only, enforced via @Roles) ─────────────────
 
+  listAllCities() {
+    return this.prisma.city.findMany({
+      orderBy: [{ launchOrder: 'asc' }, { createdAt: 'asc' }],
+      include: { _count: { select: { branches: true } } },
+    });
+  }
+
   createCity(dto: CreateCityDto) {
     return this.prisma.city.create({
       data: {

@@ -16,27 +16,28 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000/api/v1
 /** Tokens live here; auth.store mirrors them (persisted) and listens for updates/clears. */
 const tokens: { access: string | null; refresh: string | null } = { access: null, refresh: null };
 
-interface AuthCallbacks {
-  onTokensRefreshed?: (accessToken: string, refreshToken: string) => void;
-  onAuthCleared?: () => void;
-}
-
-let authCallbacks: AuthCallbacks = {};
+let tokensUpdatedListener: ((access: string, refresh: string) => void) | null = null;
+let authClearedListener: (() => void) | null = null;
 
 export function setTokens(access: string | null, refresh: string | null): void {
   tokens.access = access;
   tokens.refresh = refresh;
 }
 
-/** Registers lifecycle callbacks from auth.store (single bridge, no duplicate listeners). */
-export function registerAuthCallbacks(callbacks: AuthCallbacks): void {
-  authCallbacks = callbacks;
+/** Subscribes to rotated access/refresh token pairs from automatic 401 refresh. */
+export function onTokensUpdated(listener: (access: string, refresh: string) => void): void {
+  tokensUpdatedListener = listener;
+}
+
+/** Subscribes to session clears triggered when refresh rotation fails. */
+export function onAuthCleared(listener: () => void): void {
+  authClearedListener = listener;
 }
 
 function clearAuth(): void {
   tokens.access = null;
   tokens.refresh = null;
-  authCallbacks.onAuthCleared?.();
+  authClearedListener?.();
 }
 
 export class ApiError extends Error {
@@ -77,7 +78,7 @@ async function refreshAccessToken(): Promise<boolean> {
       if (!tokens.refresh) return false;
       tokens.access = body.accessToken;
       tokens.refresh = body.refreshToken;
-      authCallbacks.onTokensRefreshed?.(body.accessToken, body.refreshToken);
+      tokensUpdatedListener?.(body.accessToken, body.refreshToken);
       return true;
     } catch {
       return false;
@@ -328,6 +329,8 @@ export const api = {
 
   // ── Dispatch (technician) ─────────────────────────────────────────────────
 
+  dispatchMe: () => request<TechnicianMe>('/dispatch/technician/me'),
+
   dispatchStatus: (payload: {
     isOnline: boolean;
     isAcceptingOffers?: boolean;
@@ -386,6 +389,126 @@ export const api = {
     request<Record<string, unknown>>(`/admin/technicians/${profileId}`, {
       method: 'PATCH',
       body: JSON.stringify(payload),
+    }),
+
+  // ── Super Admin Control & Finance ─────────────────────────────────────────
+
+  adminFinanceSummary: () => request<AdminFinanceSummary>('/admin/finance/summary'),
+
+  adminCities: () => request<AdminCity[]>('/admin/cities'),
+
+  createCity: (payload: {
+    slug: string;
+    nameFa: string;
+    nameEn: string;
+    centerLat: number;
+    centerLng: number;
+    launchOrder?: number;
+  }) =>
+    request<AdminCity>('/admin/cities', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  updateCity: (
+    cityId: string,
+    payload: {
+      slug?: string;
+      nameFa?: string;
+      nameEn?: string;
+      centerLat?: number;
+      centerLng?: number;
+      launchOrder?: number;
+      isActive?: boolean;
+    },
+  ) =>
+    request<AdminCity>(`/admin/cities/${cityId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+
+  createBranch: (payload: {
+    cityId: string;
+    code: string;
+    nameFa: string;
+    addressFa: string;
+    phone?: string;
+    lat: number;
+    lng: number;
+    serviceRadiusMeters?: number;
+    hasPhysicalShowroom?: boolean;
+    commissionRateOverride?: number | null;
+    warrantyReserveOverride?: number | null;
+    isActive?: boolean;
+  }) =>
+    request<AdminBranch>('/admin/branches', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  updateBranch: (
+    branchId: string,
+    payload: {
+      nameFa?: string;
+      addressFa?: string;
+      phone?: string;
+      lat?: number;
+      lng?: number;
+      serviceRadiusMeters?: number;
+      hasPhysicalShowroom?: boolean;
+      commissionRateOverride?: number | null;
+      warrantyReserveOverride?: number | null;
+      isActive?: boolean;
+    },
+  ) =>
+    request<AdminBranch>(`/admin/branches/${branchId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+
+  adminAdvisoryRules: () => request<AdminAdvisoryRule[]>('/admin/advisory/rules'),
+
+  createAdvisoryRule: (payload: {
+    code: string;
+    pillar: string;
+    priority?: number;
+    appliesToLocationTypes?: string[];
+    condition: Record<string, unknown>;
+    suggestedActionFa: string;
+    suggestedServiceKey?: ServiceKey;
+    suggestedConfig?: Record<string, unknown>;
+    scoreImpact?: Record<string, unknown>;
+  }) =>
+    request<AdminAdvisoryRule>('/admin/advisory/rules', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  updateAdvisoryRule: (
+    ruleId: string,
+    payload: {
+      pillar?: string;
+      priority?: number;
+      appliesToLocationTypes?: string[];
+      condition?: Record<string, unknown>;
+      suggestedActionFa?: string;
+      suggestedServiceKey?: ServiceKey;
+      suggestedConfig?: Record<string, unknown>;
+      scoreImpact?: Record<string, unknown>;
+      isActive?: boolean;
+    },
+  ) =>
+    request<AdminAdvisoryRule>(`/admin/advisory/rules/${ruleId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+
+  adminPlatformConfig: () => request<PlatformConfigEntry[]>('/admin/platform-config'),
+
+  updatePlatformConfig: (key: string, value: Record<string, unknown>) =>
+    request<PlatformConfigEntry>(`/admin/platform-config/${encodeURIComponent(key)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ value }),
     }),
 };
 
@@ -494,11 +617,96 @@ export interface WarrantyClaim {
 
 export type AdminWarrantyClaim = WarrantyClaim;
 
+export interface TechnicianMe {
+  technicianId: string;
+  status: string;
+  isOnline: boolean;
+  isAcceptingOffers: boolean;
+  lastKnownLat: number | null;
+  lastKnownLng: number | null;
+  rating: number;
+  ratingCount: number;
+  completedJobs: number;
+  warrantyClaimRate: number;
+}
+
 export interface AdminBranch {
   id: string;
+  cityId: string;
   code: string;
   nameFa: string;
+  addressFa: string;
+  phone: string | null;
+  lat: number;
+  lng: number;
+  serviceRadiusMeters: number;
+  hasPhysicalShowroom: boolean;
+  commissionRateOverride: number | null;
+  warrantyReserveOverride: number | null;
+  isActive: boolean;
   city?: { id: string; slug: string; nameFa: string };
+}
+
+export interface AdminCity {
+  id: string;
+  slug: string;
+  nameFa: string;
+  nameEn: string;
+  isActive: boolean;
+  launchOrder: number;
+  centerLat: number;
+  centerLng: number;
+  _count?: { branches: number };
+}
+
+export interface AdminBranchFinanceRow {
+  branchId: string;
+  branchCode: string;
+  nameFa: string;
+  cityNameFa: string | null;
+  isActive: boolean;
+  hasPhysicalShowroom: boolean;
+  commissionRateOverride: number | null;
+  warrantyReserveOverride: number | null;
+  effectiveCommissionRate: number;
+  effectiveWarrantyReserveRate: number;
+  orderCount: number;
+  completedOrderCount: number;
+  completedRevenue: string;
+}
+
+export interface AdminFinanceSummary {
+  platformBalance: string;
+  totalPlatformCommission: string;
+  totalWarrantyReserve: string;
+  totalTechnicianPayout: string;
+  activeHeldInEscrow: string;
+  defaultCommissionRate: number;
+  defaultWarrantyReserveRate: number;
+  branches: AdminBranchFinanceRow[];
+}
+
+export interface AdminAdvisoryRule {
+  id: string;
+  code: string;
+  pillar: string;
+  priority: number;
+  appliesToLocationTypes: string[];
+  condition: Record<string, unknown>;
+  suggestedActionFa: string;
+  suggestedServiceKey: ServiceKey | null;
+  suggestedConfig: Record<string, unknown> | null;
+  scoreImpact: Record<string, unknown>;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PlatformConfigEntry {
+  key: string;
+  value: Record<string, unknown>;
+  updatedAt: string | null;
+  updatedBy: string | null;
 }
 
 export interface AdminTechniciansPage {

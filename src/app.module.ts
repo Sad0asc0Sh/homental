@@ -6,6 +6,7 @@ import { RealtimeModule } from '@infra/realtime/realtime.module';
 import { RedisModule } from '@infra/redis/redis.module';
 import { AuthModule } from '@modules/auth/auth.module';
 import { JwtConfigModule } from '@modules/auth/jwt-config.module';
+import { AdminConfigModule } from '@modules/admin-config/admin-config.module';
 import { CitiesBranchesModule } from '@modules/cities-branches/cities-branches.module';
 import { HealthModule } from '@modules/health/health.module';
 import { NotificationsModule } from '@modules/notifications/notifications.module';
@@ -29,6 +30,7 @@ import { WalletEscrowModule } from '@modules/wallet-escrow/wallet-escrow.module'
     UsersModule,
     CitiesBranchesModule,
     WalletEscrowModule,
+    AdminConfigModule,
     SecurityServicesModule,
   ],
 })

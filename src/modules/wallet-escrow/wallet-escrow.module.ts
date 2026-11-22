@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { AdminFinanceController } from './admin-finance.controller';
 import { WalletController } from './wallet.controller';
 import { WalletEscrowService } from './wallet-escrow.service';
 
@@ -7,7 +8,7 @@ import { WalletEscrowService } from './wallet-escrow.service';
  * cafe booking, second-hand goods, etc. It MUST NEVER import any vertical.
  */
 @Module({
-  controllers: [WalletController],
+  controllers: [WalletController, AdminFinanceController],
   providers: [WalletEscrowService],
   exports: [WalletEscrowService],
 })

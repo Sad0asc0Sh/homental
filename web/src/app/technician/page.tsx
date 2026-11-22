@@ -15,7 +15,7 @@ import {
 } from 'lucide-react';
 import { AuthModal } from '@/components/brief/AuthModal';
 import { StateBadge, STATE_LABELS } from '@/components/orders/order-state';
-import { api, ApiError, type OrderRow } from '@/lib/api';
+import { api, ApiError, type OrderRow, type TechnicianMe } from '@/lib/api';
 import { formatToman, toLatinDigits, toPersianDigits } from '@/lib/format';
 import {
   parseNotificationPayload,
@@ -107,6 +107,7 @@ export default function TechnicianPage() {
   const [authOpen, setAuthOpen] = useState(false);
   const [isOnline, setIsOnline] = useState(false);
   const [isAcceptingOffers, setIsAcceptingOffers] = useState(true);
+  const [techStats, setTechStats] = useState<TechnicianMe | null>(null);
   const [statusBusy, setStatusBusy] = useState(false);
   const [coords, setCoords] = useState<{ lat: number; lng: number }>(MASHHAD_PRESETS[0]);
   const [offers, setOffers] = useState<LiveOffer[]>([]);
@@ -145,9 +146,20 @@ export default function TechnicianPage() {
       setOrders(null);
       setOffers([]);
       setIsOnline(false);
+      setTechStats(null);
       return;
     }
     reloadOrders();
+    api.dispatchMe()
+      .then((me) => {
+        setTechStats(me);
+        setIsOnline(me.isOnline);
+        setIsAcceptingOffers(me.isAcceptingOffers);
+        if (me.lastKnownLat !== null && me.lastKnownLng !== null) {
+          setCoords({ lat: me.lastKnownLat, lng: me.lastKnownLng });
+        }
+      })
+      .catch(() => undefined);
   }, [accessToken, user?.role, reloadOrders]);
 
   const runAction = useCallback(
@@ -258,9 +270,7 @@ export default function TechnicianPage() {
   );
 
   const onOfferTaken = useCallback((payload: DispatchEventPayloads['OFFER_TAKEN']) => {
-    setOffers((prev) =>
-      prev.filter((offer) => offer.orderId !== payload.orderId && offer.offerId !== payload.offerId),
-    );
+    setOffers((prev) => prev.filter((offer) => offer.orderId !== payload.orderId));
     setToast('سفارش توسط کارشناس دیگری پذیرفته شد');
   }, []);
 
@@ -463,6 +473,19 @@ export default function TechnicianPage() {
             </button>
           ))}
         </div>
+        {techStats ? (
+          <div className="flex flex-wrap gap-2 border-t border-slate-100 pt-2.5 text-[11px]">
+            <span className="chip bg-slate-50 font-bold text-slate-700">
+              ⭐ {toPersianDigits(techStats.rating.toFixed(1))} ({toPersianDigits(techStats.ratingCount)} نظر)
+            </span>
+            <span className="chip bg-slate-50 font-bold text-slate-700">
+              نصب موفق: {toPersianDigits(techStats.completedJobs)}
+            </span>
+            <span className="chip bg-slate-50 font-bold text-slate-700">
+              نرخ خرابی ضمانت: {toPersianDigits((techStats.warrantyClaimRate * 100).toFixed(1))}٪
+            </span>
+          </div>
+        ) : null}
       </section>
 
       {/* ── Live offers tray ── */}

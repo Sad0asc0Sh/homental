@@ -30,6 +30,12 @@ export class AdminCitiesBranchesController {
   // ── Cities: SUPER_ADMIN only (multi-city rollout control) ────────────────
 
   @Roles(UserRole.SUPER_ADMIN)
+  @Get('cities')
+  async listCities() {
+    return this.citiesBranchesService.listAllCities();
+  }
+
+  @Roles(UserRole.SUPER_ADMIN)
   @Post('cities')
   async createCity(@Body() dto: CreateCityDto) {
     return this.citiesBranchesService.createCity(dto);

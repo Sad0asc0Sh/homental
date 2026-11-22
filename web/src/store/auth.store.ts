@@ -2,7 +2,7 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { api, registerAuthCallbacks, setTokens } from '@/lib/api';
+import { api, onAuthCleared, onTokensUpdated, setTokens } from '@/lib/api';
 
 interface AuthState {
   hasHydrated: boolean;
@@ -57,11 +57,10 @@ export const useAuthStore = create<AuthState>()(
   ),
 );
 
-registerAuthCallbacks({
-  onTokensRefreshed: (accessToken, refreshToken) => {
-    useAuthStore.setState({ accessToken, refreshToken });
-  },
-  onAuthCleared: () => {
-    useAuthStore.setState({ accessToken: null, refreshToken: null, phone: null, user: null });
-  },
+onTokensUpdated((accessToken, refreshToken) => {
+  useAuthStore.setState({ accessToken, refreshToken });
+});
+
+onAuthCleared(() => {
+  useAuthStore.setState({ accessToken: null, refreshToken: null, phone: null, user: null });
 });

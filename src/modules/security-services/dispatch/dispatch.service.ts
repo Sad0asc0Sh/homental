@@ -340,7 +340,7 @@ export class DispatchService {
     for (const loser of losers) {
       this.realtimeService.emitToUser(loser.technician.userId, RealtimeEvent.OFFER_TAKEN, {
         orderId: offer.orderId,
-        offerId,
+        offerId: loser.id,
         takenByAnotherExpert: true,
       });
     }
@@ -388,6 +388,27 @@ export class DispatchService {
   }
 
   // ── Technician status & location sync ─────────────────────────────────────
+
+  async getTechnicianMe(actor: AuthenticatedUser) {
+    const profile = await this.prisma.technicianProfile.findUnique({
+      where: { userId: actor.id },
+    });
+    if (!profile) {
+      throw new NotFoundException({ statusCode: 404, message: 'پروفایل تکنسین یافت نشد.' });
+    }
+    return {
+      technicianId: profile.id,
+      status: profile.status,
+      isOnline: profile.isOnline,
+      isAcceptingOffers: profile.isAcceptingOffers,
+      lastKnownLat: profile.lastKnownLat !== null ? Number(profile.lastKnownLat) : null,
+      lastKnownLng: profile.lastKnownLng !== null ? Number(profile.lastKnownLng) : null,
+      rating: Number(profile.rating),
+      ratingCount: profile.ratingCount,
+      completedJobs: profile.completedJobs,
+      warrantyClaimRate: Number(profile.warrantyClaimRate),
+    };
+  }
 
   async setTechnicianStatus(
     actor: AuthenticatedUser,

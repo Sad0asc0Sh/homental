@@ -4,15 +4,17 @@ Production-grade **NestJS Modular Monolith** backend + **Next.js RTL Persian** s
 frontend. Phase 1 pilot: Smart Security Advisor & Snapp-like Dispatch in **Mashhad** —
 designed to scale into a multi-city Super-App without rewriting the core.
 
-## Quick Start (Backend + Frontend together)
+## Quick Start
 
-### 1. Infrastructure (PostgreSQL+PostGIS & Redis)
+### Option A: Local Development (Infra in Docker, API + Web locally)
+
+#### 1. Infrastructure (PostgreSQL+PostGIS & Redis)
 
 ```bash
 docker compose up -d          # postgis/postgis:16-3.4 on :5432, redis:7-alpine on :6379
 ```
 
-### 2. Backend (NestJS — http://localhost:3000)
+#### 2. Backend (NestJS — http://localhost:3000)
 
 ```bash
 npm install
@@ -22,7 +24,7 @@ npm run prisma:seed           # Mashhad city, branch, technicians, 4 service sch
 npm run start:dev             # API on http://localhost:3000 — Swagger at /docs — health at /health
 ```
 
-### 3. Frontend (Next.js — http://localhost:3001)
+#### 3. Frontend (Next.js — http://localhost:3001)
 
 ```bash
 cd web
@@ -30,6 +32,20 @@ npm install
 cp .env.example .env.local    # NEXT_PUBLIC_API_URL=http://localhost:3000/api/v1 & NEXT_PUBLIC_WS_URL=http://localhost:3000
 npm run dev                   # RTL Persian UI on http://localhost:3001
 ```
+
+### Option B: One-Command Full-Stack Docker (`postgres` + `redis` + `api` + `web`)
+
+```bash
+# Production mode (OTP_DEV_ECHO=false by default):
+docker compose --profile fullstack up --build -d
+
+# Seed initial Mashhad data inside the running api container:
+docker compose --profile fullstack exec api npx prisma db seed
+```
+
+> To run the local OTP demo inside Docker without an SMS provider, pass
+> `NODE_ENV=development OTP_DEV_ECHO=true docker compose --profile fullstack up --build -d`
+> (Zod blocks `OTP_DEV_ECHO=true` whenever `NODE_ENV=production`).
 
 Open **http://localhost:3001** → choose a location (Path 1) or browse the 3 engineering
 pillars (Path 2) → configure services (schema-driven) → watch the live readiness meter &
@@ -39,7 +55,7 @@ price range → review the Smart Brief → login with phone OTP (dev code echoed
 With `OTP_DEV_ECHO=true` (dev only), login codes and handover OTPs are echoed in API
 responses — Zod fails fast if enabled in production.
 
-## Demo Walkthrough — full 3-role Mashhad loop in ~5 minutes
+## Demo Walkthrough — full 4-role Mashhad loop in ~5 minutes
 
 Seed data (after `npm run prisma:seed`) contains these Mashhad pilot phone numbers (login
 = phone OTP via the header **ورود** button on any page or inline login prompt; both
@@ -52,6 +68,7 @@ canonical `+989...` and local `09...` formats work, with `devCode` echoed in dev
 | Technician 2 | `+989120000011` (`09120000011`, رضا احمدی) | ELECTRIC_SHUTTER + PARKING_JACK, rating ۴.۶ |
 | Technician 3 | `+989120000012` (`09120000012`, مهدی نوری) | all 4 skills, rating ۴.۹ |
 | Mashhad Branch Admin | `+989120000002` (`09120000002`, حسین رضایی) | شعبه مرکزی مشهد — ۱۰٪ commission override |
+| Super Admin | `+989120000001` (`09120000001`, مدیر سامانه) | full platform control & `/admin` finance reserve dashboard |
 
 Steps (use **two browser windows/profiles** — one Customer, one Technician/Branch Admin):
 
@@ -78,6 +95,11 @@ Steps (use **two browser windows/profiles** — one Customer, one Technician/Bra
    - **صف سفارش‌ها**: filter `BRANCH_QUEUE` & manually assign an `APPROVED` technician.
    - **مدیریت تکنسین‌ها**: view skills/rating/claim rate/online status, approve/suspend, or add a technician.
    - **رسیدگی به تیکت‌های ضمانت**: update claim status (`IN_REVIEW` / `APPROVED` / `RESOLVED` / `REJECTED`) with `resolutionNoteFa` — customer's warranty returns to `ACTIVE` once resolved.
+8. **Super Admin** (`/admin`):
+   - **داشبورد مالی و صندوق ۵٪ ضمانت**: inspect `PLATFORM` balance, total commission, **صندوق ذخیره ریسک ضمانت ۵٪**, active Escrow, and per-branch dual-commission comparison.
+   - **توسعه شهرها و نمایندگی‌ها**: launch/toggle cities and configure showroom partner branches & rate overrides.
+   - **قوانین مشاوره هوشمند**: manage JSON-Logic rules live.
+   - **تنظیمات داینامیک پلتفرم**: tune Surge cap (≤ ۱.۲۵), Urgency multipliers, Bundle tiers, Escrow split, and Dispatch scoring weights without redeploying.
 
 ## Repository Layout
 
@@ -88,23 +110,24 @@ Steps (use **two browser windows/profiles** — one Customer, one Technician/Bra
 │   ├── common/        guards (@Public/@Roles/@CurrentUser), filters, BigInt serializer
 │   ├── infrastructure/ prisma (PostGIS), redis (GEO/Locks/PubSub/Patterns), realtime (WS /dispatch)
 │   └── modules/
-│       ├── auth, users, cities-branches, notifications, wallet-escrow   ← CORE (vertical-agnostic)
+│       ├── admin-config, auth, users, cities-branches, notifications, wallet-escrow ← CORE (vertical-agnostic)
 │       ├── health
 │       └── security-services/                                          ← THE Phase-1 vertical
 │           ├── catalog (schema-driven), advisory (JSON-Logic 3-pillar scoring)
 │           ├── pricing (BigInt interpreter, surge/urgency/bundles)
 │           ├── orders (12-state machine + escrow), dispatch (atomic lock waves)
 │           ├── warranty (handover gate), reviews
-├── web/               Next.js 14 App Router — RTL Persian schema-driven UI
+├── web/               Next.js 14 App Router — RTL Persian schema-driven UI (+ web/Dockerfile)
 ├── ARCHITECTURE.md    17 locked invariants + module map + build order
-└── docker-compose.yml postgis:16-3.4 + redis:7-alpine (healthchecks)
+├── Dockerfile         multi-stage Node 20 Alpine NestJS production image
+└── docker-compose.yml postgis:16-3.4 + redis:7-alpine (+ fullstack profile for api & web)
 ```
 
 ## Scripts (backend root)
 
 | Command | Purpose |
 |---|---|
-| `npm run build` / `lint` / `test` | 27 suites, 273 tests |
+| `npm run build` / `lint` / `test` | 28 suites, 282 tests |
 | `npm run prisma:generate` / `deploy` / `migrate` / `seed` | DB tooling |
 | `npm run infra:up` / `down` | docker compose lifecycle |
 | `npm run start:dev` | watch mode on :3000 |

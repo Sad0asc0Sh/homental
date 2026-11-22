@@ -384,6 +384,105 @@ export class WalletEscrowService {
     };
   }
 
+  // ── Super Admin finance & 5% warranty reserve summary ─────────────────────
+
+  async getFinanceSummary() {
+    const [
+      platformWallet,
+      commissionAgg,
+      reserveAgg,
+      payoutAgg,
+      escrowAgg,
+      defaultRates,
+      branches,
+      totalOrdersByBranch,
+      completedOrdersByBranch,
+    ] = await Promise.all([
+      this.prisma.wallet.findUnique({
+        where: { ownerType_ownerId: { ownerType: 'PLATFORM', ownerId: PLATFORM_WALLET_OWNER_ID } },
+      }),
+      this.prisma.walletTransaction.aggregate({
+        where: { type: 'PLATFORM_COMMISSION', status: 'SETTLED' },
+        _sum: { amount: true },
+      }),
+      this.prisma.walletTransaction.aggregate({
+        where: { type: 'WARRANTY_RESERVE', status: 'SETTLED' },
+        _sum: { amount: true },
+      }),
+      this.prisma.walletTransaction.aggregate({
+        where: { type: 'TECHNICIAN_PAYOUT', status: 'SETTLED' },
+        _sum: { amount: true },
+      }),
+      this.prisma.wallet.aggregate({
+        where: { ownerType: 'CUSTOMER' },
+        _sum: { heldInEscrow: true },
+      }),
+      this.resolveSplitRates(this.prisma, null),
+      this.prisma.branch.findMany({
+        orderBy: { createdAt: 'asc' },
+        include: { city: { select: { nameFa: true, slug: true } } },
+      }),
+      this.prisma.serviceOrder.groupBy({
+        by: ['branchId'],
+        where: { branchId: { not: null } },
+        _count: { _all: true },
+      }),
+      this.prisma.serviceOrder.groupBy({
+        by: ['branchId'],
+        where: { branchId: { not: null }, state: 'COMPLETED_WARRANTY_ACTIVE' },
+        _count: { _all: true },
+        _sum: { finalQuoteAmount: true },
+      }),
+    ]);
+
+    const totalOrderMap = new Map<string, number>();
+    for (const row of totalOrdersByBranch) {
+      if (row.branchId) totalOrderMap.set(row.branchId, row._count._all);
+    }
+
+    const completedOrderMap = new Map<string, number>();
+    const completedRevenueMap = new Map<string, bigint>();
+    for (const row of completedOrdersByBranch) {
+      if (row.branchId) {
+        completedOrderMap.set(row.branchId, row._count._all);
+        completedRevenueMap.set(row.branchId, row._sum.finalQuoteAmount ?? 0n);
+      }
+    }
+
+    return {
+      platformBalance: platformWallet?.balance ?? 0n,
+      totalPlatformCommission: commissionAgg._sum.amount ?? 0n,
+      totalWarrantyReserve: reserveAgg._sum.amount ?? 0n,
+      totalTechnicianPayout: payoutAgg._sum.amount ?? 0n,
+      activeHeldInEscrow: escrowAgg._sum.heldInEscrow ?? 0n,
+      defaultCommissionRate: defaultRates.commissionRate,
+      defaultWarrantyReserveRate: defaultRates.reserveRate,
+      branches: branches.map((b) => ({
+        branchId: b.id,
+        branchCode: b.code,
+        nameFa: b.nameFa,
+        cityNameFa: b.city?.nameFa ?? null,
+        isActive: b.isActive,
+        hasPhysicalShowroom: b.hasPhysicalShowroom,
+        commissionRateOverride:
+          b.commissionRateOverride !== null ? Number(b.commissionRateOverride) : null,
+        warrantyReserveOverride:
+          b.warrantyReserveOverride !== null ? Number(b.warrantyReserveOverride) : null,
+        effectiveCommissionRate:
+          b.commissionRateOverride !== null
+            ? Number(b.commissionRateOverride)
+            : defaultRates.commissionRate,
+        effectiveWarrantyReserveRate:
+          b.warrantyReserveOverride !== null
+            ? Number(b.warrantyReserveOverride)
+            : defaultRates.reserveRate,
+        orderCount: totalOrderMap.get(b.id) ?? 0,
+        completedOrderCount: completedOrderMap.get(b.id) ?? 0,
+        completedRevenue: completedRevenueMap.get(b.id) ?? 0n,
+      })),
+    };
+  }
+
   // ── Private helpers ───────────────────────────────────────────────────────
 
   private async requireWalletByOwner(db: Db, ownerType: WalletOwnerType, ownerId: string) {

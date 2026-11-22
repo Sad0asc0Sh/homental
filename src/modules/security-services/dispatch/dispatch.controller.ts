@@ -1,4 +1,4 @@
-import { Body, Controller, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import { CurrentUser } from '@common/decorators/current-user.decorator';
 import { Roles } from '@common/decorators/roles.decorator';
@@ -13,6 +13,11 @@ import { TechnicianLocationDto, TechnicianStatusDto } from './dto/dispatch.dto';
 @Controller('dispatch')
 export class DispatchController {
   constructor(private readonly dispatchService: DispatchService) {}
+
+  @Get('technician/me')
+  async getMyStatus(@CurrentUser() actor: AuthenticatedUser) {
+    return this.dispatchService.getTechnicianMe(actor);
+  }
 
   @Post('technician/status')
   async setStatus(@CurrentUser() actor: AuthenticatedUser, @Body() dto: TechnicianStatusDto) {

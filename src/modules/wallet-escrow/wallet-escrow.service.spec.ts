@@ -268,8 +268,120 @@ describe('WalletEscrowService — topUp', () => {
     await service.topUp({ ownerType: 'CUSTOMER', ownerId: 'c1', amount: 1_000_000n, idempotencyKey: 't-same' });
     await service.topUp({ ownerType: 'CUSTOMER', ownerId: 'c1', amount: 1_000_000n, idempotencyKey: 't-same' });
     expect(customerWallet.balance).toBe(11_000_000n);
-    await expect(
+  await expect(
       service.topUp({ ownerType: 'CUSTOMER', ownerId: 'c1', amount: 0n, idempotencyKey: 't-zero' }),
     ).rejects.toThrow(BadRequestException);
+  });
+});
+
+describe('WalletEscrowService — getFinanceSummary', () => {
+  it('aggregates PLATFORM wallet, 5% warranty reserve, held escrow and per-branch breakdown in BigInt', async () => {
+    const prisma = {
+      wallet: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'w-platform',
+          ownerType: 'PLATFORM',
+          ownerId: PLATFORM_ID,
+          balance: 600_000n,
+          heldInEscrow: 0n,
+        }),
+        aggregate: jest.fn().mockResolvedValue({ _sum: { heldInEscrow: 4_500_000n } }),
+      },
+      walletTransaction: {
+        aggregate: jest.fn(async ({ where }: { where: { type: string } }) => {
+          if (where.type === 'PLATFORM_COMMISSION') return { _sum: { amount: 420_000n } };
+          if (where.type === 'WARRANTY_RESERVE') return { _sum: { amount: 180_000n } };
+          if (where.type === 'TECHNICIAN_PAYOUT') return { _sum: { amount: 3_000_000n } };
+          return { _sum: { amount: 0n } };
+        }),
+      },
+      platformConfig: {
+        findUnique: jest.fn().mockResolvedValue({
+          key: 'escrow.split',
+          value: { platformCommissionRate: 0.15, warrantyReserveRate: 0.05 },
+        }),
+      },
+      branch: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'b-mshd',
+            code: 'MSHD-C1',
+            nameFa: 'شعبه مرکزی مشهد',
+            isActive: true,
+            hasPhysicalShowroom: true,
+            commissionRateOverride: 0.1,
+            warrantyReserveOverride: null,
+            city: { nameFa: 'مشهد', slug: 'mashhad' },
+          },
+          {
+            id: 'b-tehran',
+            code: 'TEH-01',
+            nameFa: 'شعبه تهران',
+            isActive: true,
+            hasPhysicalShowroom: false,
+            commissionRateOverride: null,
+            warrantyReserveOverride: null,
+            city: { nameFa: 'تهران', slug: 'tehran' },
+          },
+        ]),
+      },
+      serviceOrder: {
+        groupBy: jest.fn(async ({ where }: { where: { state?: string } }) => {
+          if (where.state === 'COMPLETED_WARRANTY_ACTIVE') {
+            return [
+              { branchId: 'b-mshd', _count: { _all: 3 }, _sum: { finalQuoteAmount: 3_600_000n } },
+            ];
+          }
+          return [
+            { branchId: 'b-mshd', _count: { _all: 5 } },
+            { branchId: 'b-tehran', _count: { _all: 1 } },
+          ];
+        }),
+      },
+    } as unknown as import('@infra/prisma/prisma.service').PrismaService;
+
+    const service = new WalletEscrowService(prisma);
+    const summary = await service.getFinanceSummary();
+
+    expect(summary.platformBalance).toBe(600_000n);
+    expect(summary.totalPlatformCommission).toBe(420_000n);
+    expect(summary.totalWarrantyReserve).toBe(180_000n);
+    expect(summary.totalTechnicianPayout).toBe(3_000_000n);
+    expect(summary.activeHeldInEscrow).toBe(4_500_000n);
+    expect(summary.defaultCommissionRate).toBe(0.15);
+    expect(summary.defaultWarrantyReserveRate).toBe(0.05);
+
+    expect(summary.branches).toEqual([
+      {
+        branchId: 'b-mshd',
+        branchCode: 'MSHD-C1',
+        nameFa: 'شعبه مرکزی مشهد',
+        cityNameFa: 'مشهد',
+        isActive: true,
+        hasPhysicalShowroom: true,
+        commissionRateOverride: 0.1,
+        warrantyReserveOverride: null,
+        effectiveCommissionRate: 0.1,
+        effectiveWarrantyReserveRate: 0.05,
+        orderCount: 5,
+        completedOrderCount: 3,
+        completedRevenue: 3_600_000n,
+      },
+      {
+        branchId: 'b-tehran',
+        branchCode: 'TEH-01',
+        nameFa: 'شعبه تهران',
+        cityNameFa: 'تهران',
+        isActive: true,
+        hasPhysicalShowroom: false,
+        commissionRateOverride: null,
+        warrantyReserveOverride: null,
+        effectiveCommissionRate: 0.15,
+        effectiveWarrantyReserveRate: 0.05,
+        orderCount: 1,
+        completedOrderCount: 0,
+        completedRevenue: 0n,
+      },
+    ]);
   });
 });
