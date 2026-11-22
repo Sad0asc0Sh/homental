@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { Loader2, Smartphone, X } from 'lucide-react';
+import { toLatinDigits } from '@/lib/format';
 import { useAuthStore } from '@/store/auth.store';
 
 /** Phone OTP login modal — surfaces backend Persian errors + devCode hint in dev. */
@@ -15,11 +16,14 @@ export function AuthModal({ onDone }: { onDone: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  const normalizedPhone = toLatinDigits(phone).trim();
+  const normalizedCode = toLatinDigits(code).replace(/\D/g, '');
+
   const submitPhone = async () => {
     setBusy(true);
     setError(null);
     try {
-      const result = await requestOtp(phone);
+      const result = await requestOtp(normalizedPhone);
       setDevCode(result.devCode ?? null);
       setStep('code');
     } catch (err) {
@@ -33,7 +37,7 @@ export function AuthModal({ onDone }: { onDone: () => void }) {
     setBusy(true);
     setError(null);
     try {
-      await verifyOtp(phone, code);
+      await verifyOtp(normalizedPhone, normalizedCode);
       onDone();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'خطا در تأیید کد.');
@@ -62,10 +66,13 @@ export function AuthModal({ onDone }: { onDone: () => void }) {
               inputMode="tel"
               value={phone}
               onChange={(event) => setPhone(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !busy && normalizedPhone.length >= 10) void submitPhone();
+              }}
               placeholder="09123456789"
               className="w-full rounded-xl border border-slate-200 px-4 py-3 text-left font-bold focus:border-primary-400 focus:outline-none"
             />
-            <button type="button" onClick={submitPhone} disabled={busy || phone.length < 10} className="btn-primary w-full">
+            <button type="button" onClick={submitPhone} disabled={busy || normalizedPhone.length < 10} className="btn-primary w-full">
               {busy ? <Loader2 size={16} className="animate-spin" /> : 'دریافت کد تأیید'}
             </button>
           </div>
@@ -79,13 +86,29 @@ export function AuthModal({ onDone }: { onDone: () => void }) {
             <input
               dir="ltr"
               inputMode="numeric"
+              maxLength={6}
               value={code}
               onChange={(event) => setCode(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !busy && normalizedCode.length === 6) void submitCode();
+              }}
               placeholder="کد ۶ رقمی"
               className="tabular-fa w-full rounded-xl border border-slate-200 px-4 py-3 text-center text-lg font-extrabold tracking-widest focus:border-primary-400 focus:outline-none"
             />
-            <button type="button" onClick={submitCode} disabled={busy || code.length !== 6} className="btn-primary w-full">
+            <button type="button" onClick={submitCode} disabled={busy || normalizedCode.length !== 6} className="btn-primary w-full">
               {busy ? <Loader2 size={16} className="animate-spin" /> : 'تأیید و ورود'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setStep('phone');
+                setCode('');
+                setDevCode(null);
+                setError(null);
+              }}
+              className="w-full text-center text-xs font-bold text-slate-500 hover:text-primary-700"
+            >
+              تغییر شماره موبایل
             </button>
           </div>
         )}

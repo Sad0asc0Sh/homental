@@ -2,9 +2,10 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { api, onAuthCleared, setTokens } from '@/lib/api';
+import { api, registerAuthCallbacks, setTokens } from '@/lib/api';
 
 interface AuthState {
+  hasHydrated: boolean;
   accessToken: string | null;
   refreshToken: string | null;
   phone: string | null;
@@ -17,6 +18,7 @@ interface AuthState {
 export const useAuthStore = create<AuthState>()(
   persist(
     (set, get) => ({
+      hasHydrated: false,
       accessToken: null,
       refreshToken: null,
       phone: null,
@@ -31,6 +33,10 @@ export const useAuthStore = create<AuthState>()(
         set({ accessToken: result.accessToken, refreshToken: result.refreshToken, phone, user: result.user });
       },
       logout: () => {
+        const rt = get().refreshToken;
+        if (rt && get().accessToken) {
+          void api.logout(rt).catch(() => undefined);
+        }
         setTokens(null, null);
         set({ accessToken: null, refreshToken: null, phone: null, user: null });
       },
@@ -44,15 +50,18 @@ export const useAuthStore = create<AuthState>()(
         user: state.user,
       }),
       onRehydrateStorage: () => (state) => {
-        if (state?.accessToken || state?.refreshToken) {
-          setTokens(state.accessToken, state.refreshToken);
-        }
-        // Automatic token refresh rotation: when api.ts clears auth after a
-        // failed refresh, this resets the persisted zustand state cleanly.
-        onAuthCleared(() => {
-          useAuthStore.setState({ accessToken: null, refreshToken: null, phone: null, user: null });
-        });
+        setTokens(state?.accessToken ?? null, state?.refreshToken ?? null);
+        useAuthStore.setState({ hasHydrated: true });
       },
     },
   ),
 );
+
+registerAuthCallbacks({
+  onTokensRefreshed: (accessToken, refreshToken) => {
+    useAuthStore.setState({ accessToken, refreshToken });
+  },
+  onAuthCleared: () => {
+    useAuthStore.setState({ accessToken: null, refreshToken: null, phone: null, user: null });
+  },
+});

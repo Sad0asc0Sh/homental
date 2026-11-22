@@ -11,26 +11,32 @@ import type {
   UrgencyLevel,
 } from './types';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3000/api/v1';
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000/api/v1';
 
-/** Tokens live here; auth.store mirrors them (persisted) and listens for clears. */
+/** Tokens live here; auth.store mirrors them (persisted) and listens for updates/clears. */
 const tokens: { access: string | null; refresh: string | null } = { access: null, refresh: null };
-const authClearedListeners: Array<() => void> = [];
+
+interface AuthCallbacks {
+  onTokensRefreshed?: (accessToken: string, refreshToken: string) => void;
+  onAuthCleared?: () => void;
+}
+
+let authCallbacks: AuthCallbacks = {};
 
 export function setTokens(access: string | null, refresh: string | null): void {
   tokens.access = access;
   tokens.refresh = refresh;
 }
 
-/** Registers a callback fired when the session is cleared (failed refresh). */
-export function onAuthCleared(listener: () => void): void {
-  authClearedListeners.push(listener);
+/** Registers lifecycle callbacks from auth.store (single bridge, no duplicate listeners). */
+export function registerAuthCallbacks(callbacks: AuthCallbacks): void {
+  authCallbacks = callbacks;
 }
 
 function clearAuth(): void {
   tokens.access = null;
   tokens.refresh = null;
-  for (const listener of authClearedListeners) listener();
+  authCallbacks.onAuthCleared?.();
 }
 
 export class ApiError extends Error {
@@ -54,7 +60,8 @@ interface ErrorEnvelope {
 let refreshInFlight: Promise<boolean> | null = null;
 
 async function refreshAccessToken(): Promise<boolean> {
-  if (!tokens.refresh) return false;
+  const refreshToken = tokens.refresh;
+  if (!refreshToken) return false;
   if (refreshInFlight) return refreshInFlight;
 
   const promise = (async () => {
@@ -62,12 +69,15 @@ async function refreshAccessToken(): Promise<boolean> {
       const response = await fetch(`${API_URL}/auth/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refreshToken: tokens.refresh }),
+        body: JSON.stringify({ refreshToken }),
       });
       if (!response.ok) return false;
       const body = (await response.json()) as { accessToken: string; refreshToken: string };
+      // If user explicitly logged out while refresh was in flight, do not revive session.
+      if (!tokens.refresh) return false;
       tokens.access = body.accessToken;
       tokens.refresh = body.refreshToken;
+      authCallbacks.onTokensRefreshed?.(body.accessToken, body.refreshToken);
       return true;
     } catch {
       return false;
@@ -86,7 +96,8 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
     'Content-Type': 'application/json',
     ...(init.headers as Record<string, string> | undefined),
   };
-  if (tokens.access) headers['Authorization'] = `Bearer ${tokens.access}`;
+  const sentAccessToken = tokens.access;
+  if (sentAccessToken) headers['Authorization'] = `Bearer ${sentAccessToken}`;
 
   let response: Response;
   try {
@@ -95,11 +106,16 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
     throw new ApiError('ارتباط با سرور هومنتال برقرار نشد؛ اتصال اینترنت را بررسی کنید.', 0);
   }
 
-  // Seamless rotation: one 401 → single-flight refresh → retry the original call.
-  if (response.status === 401 && tokens.refresh && !retried && !path.startsWith('/auth/')) {
-    const refreshed = await refreshAccessToken();
-    if (refreshed) return request<T>(path, init, true);
-    clearAuth();
+  // Seamless rotation: one 401 → single-flight refresh (or reuse rotated token) → retry once.
+  if (response.status === 401 && !retried && !path.startsWith('/auth/')) {
+    if (tokens.access && tokens.access !== sentAccessToken) {
+      return request<T>(path, init, true);
+    }
+    if (tokens.refresh) {
+      const refreshed = await refreshAccessToken();
+      if (refreshed) return request<T>(path, init, true);
+      clearAuth();
+    }
   }
 
   const body = (await response.json().catch(() => null)) as (ErrorEnvelope & Record<string, unknown>) | null;
@@ -156,6 +172,12 @@ export const api = {
   authMe: () =>
     request<{ id: string; phone: string; role: string; branchId: string | null }>('/auth/me'),
 
+  logout: (refreshToken: string) =>
+    request<{ revoked: boolean }>('/auth/logout', {
+      method: 'POST',
+      body: JSON.stringify({ refreshToken }),
+    }),
+
   // ── Orders ────────────────────────────────────────────────────────────────
 
   createAddress: (payload: {
@@ -183,7 +205,13 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  orders: () => request<OrdersPage>('/orders'),
+  orders: (params?: { page?: number; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.limit) query.set('limit', String(params.limit));
+    const qs = query.toString();
+    return request<OrdersPage>(`/orders${qs ? `?${qs}` : ''}`);
+  },
   order: (id: string) => request<OrderDetail>(`/orders/${id}`),
   submitOrder: (id: string) =>
     request<{ orderId: string; state: string }>(`/orders/${id}/submit`, {
@@ -331,7 +359,16 @@ export const api = {
 
   // ── Admin (branch panel) ──────────────────────────────────────────────────
 
-  adminTechnicians: () => request<AdminTechniciansPage>('/admin/technicians'),
+  adminBranches: () => request<AdminBranch[]>('/admin/branches'),
+
+  adminTechnicians: (params?: { status?: string; page?: number; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.status) query.set('status', params.status);
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.limit) query.set('limit', String(params.limit));
+    const qs = query.toString();
+    return request<AdminTechniciansPage>(`/admin/technicians${qs ? `?${qs}` : ''}`);
+  },
 
   createTechnician: (payload: {
     phone: string;
@@ -387,9 +424,11 @@ export interface OrderRow {
   branchId: string | null;
   state: string;
   finalQuoteAmount: string | null;
+  pricing?: { netEstimated?: string; estimatedMin?: string; estimatedMax?: string } | null;
   urgency?: string;
   supplyMode?: SupplyMode;
   cancelReason?: string | null;
+  completedAt?: string | null;
   createdAt: string;
   items?: Array<{
     id: string;
@@ -454,6 +493,13 @@ export interface WarrantyClaim {
 }
 
 export type AdminWarrantyClaim = WarrantyClaim;
+
+export interface AdminBranch {
+  id: string;
+  code: string;
+  nameFa: string;
+  city?: { id: string; slug: string; nameFa: string };
+}
 
 export interface AdminTechniciansPage {
   items: Array<{
