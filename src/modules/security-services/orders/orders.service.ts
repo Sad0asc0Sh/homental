@@ -201,6 +201,7 @@ export class OrdersService {
       include: {
         items: { include: { serviceDefinition: { select: { key: true, titleFa: true } } } },
         stateTransitions: { orderBy: { createdAt: 'asc' } },
+        review: true,
       },
     });
   }

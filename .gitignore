@@ -6,6 +6,9 @@ dist/
 coverage/
 *.tsbuildinfo
 
+# Next.js build output & caches (web/ has its own .gitignore)
+.next/
+
 # Environment (local secrets)
 .env
 .env.local

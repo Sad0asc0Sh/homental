@@ -39,6 +39,35 @@ price range → review the Smart Brief → login with phone OTP (dev code echoed
 With `OTP_DEV_ECHO=true` (dev only), login codes and handover OTPs are echoed in API
 responses — Zod fails fast if enabled in production.
 
+## Demo Walkthrough — full 3-role Mashhad loop in ~5 minutes
+
+Seed data (after `npm run prisma:seed`) contains these phone numbers (login = phone OTP,
+code echoed in dev mode as `devCode`):
+
+| Role | Phone | Notes |
+|---|---|---|
+| Customer | `09120000020` (سارا محمدی) | wallet pre-charged ۵۰٬۰۰۰٬۰۰۰ تومان |
+| Technician 1 | `09120000010` (امیر کریمی) | ALARM + CCTV, rating ۴.۹ |
+| Technician 2 | `09120000011` (رضا احمدی) | SHUTTER + JACK, rating ۴.۶ |
+| Technician 3 | `09120000012` (مهدی نوری) | all skills, rating ۴.۹ |
+| Branch Admin | `09120000002` (حسین رضایی) | شعبه مرکزی مشهد — ۱۰٪ commission override |
+
+Steps (use **two browser windows** — one customer, one technician):
+
+1. **Customer**: login at `/brief` → pick «فروشگاه / مغازه» → apply the one-click
+   advisory («+ اعمال پیشنهاد») → urgency «فوری» → register address → ثبت پرونده.
+2. **Technician**: login at `/technician` → pick وکیل‌آباد preset → toggle **آنلاین** →
+   the live offer card appears with a 30-second countdown → **پذیرش سفارش**.
+3. **Customer** (order page, live via Socket.io): watch timeline advance → در
+   `INSPECTING` the escrow approval card appears → **تأیید قیمت و پرداخت امن**.
+4. **Technician**: «شروع نصب و اجرا» → register hardware serials → check BOTH privacy
+   checklist boxes → صدور کد تحویل → enter the customer's SMS code → **تکمیل تحویل**.
+5. **Customer**: warranty card appears at `/warranties` → submit a claim → **Branch
+   Admin** at `/branch` → Tab تیکت‌های ضمانت → approve it → back to customer's warranty
+   card shows ACTIVE again. Submit a review on the order page (updates dispatch scoring).
+6. **Branch Admin**: Tab صف سفارش‌ها — if dispatch found no technician (order in
+   «در صف شعبه»), assign one manually; Tab تکنسین‌ها — approve/suspend/add technicians.
+
 ## Repository Layout
 
 ```

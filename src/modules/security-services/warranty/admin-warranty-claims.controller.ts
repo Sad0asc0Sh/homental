@@ -1,4 +1,4 @@
-import { Body, Controller, Param, ParseUUIDPipe, Patch, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, UseGuards } from '@nestjs/common';
 import { UserRole } from '@prisma/client';
 import { CurrentUser } from '@common/decorators/current-user.decorator';
 import { Roles } from '@common/decorators/roles.decorator';
@@ -13,6 +13,11 @@ import { UpdateWarrantyClaimDto } from './dto/warranty.dto';
 @Controller('admin/warranty-claims')
 export class AdminWarrantyClaimsController {
   constructor(private readonly warrantyService: WarrantyService) {}
+
+  @Get()
+  async list(@CurrentUser() actor: AuthenticatedUser) {
+    return this.warrantyService.listClaims(actor);
+  }
 
   @Patch(':id')
   async updateClaim(

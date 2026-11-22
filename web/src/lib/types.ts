@@ -94,8 +94,8 @@ export interface ReadinessScore {
 export interface SmartBrief {
   locationType: string;
   activeServiceKeys: ServiceKey[];
-  coveredPillars: SecurityPillar[];
-  missingPillars: SecurityPillar[];
+  coveredPillars: string[];
+  missingPillars: string[];
 }
 
 export interface PricingLine {

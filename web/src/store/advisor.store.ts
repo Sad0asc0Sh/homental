@@ -221,7 +221,7 @@ export const useAdvisorStore = create<AdvisorState>()((set, get) => {
       const seq = ++evaluateSeq;
       set({ isEvaluating: true, evaluateError: null });
       try {
-        const result: EvaluateResponse = await api.advisorEvaluate({
+        const result = await api.advisorEvaluate({
           locationType: state.locationType,
           buildingContext: state.buildingContext,
           servicesConfig: buildServicesConfig(),

@@ -430,6 +430,25 @@ export class WarrantyService {
     return { claim: updated, warrantyStatus: remainingOpen === 0 ? 'ACTIVE' : 'IN_CLAIM' };
   }
 
+  /** Branch-scoped claims queue (BRANCH_ADMIN sees own branch only; SUPER_ADMIN all). */
+  async listClaims(actor: AuthenticatedUser) {
+    const where: Prisma.WarrantyClaimWhereInput =
+      actor.role === 'BRANCH_ADMIN'
+        ? { warranty: { order: { branchId: actor.branchId ?? '__none__' } } }
+        : {};
+    return this.prisma.warrantyClaim.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        warranty: {
+          include: {
+            order: { select: { id: true, orderNumber: true, branchId: true, customerId: true } },
+          },
+        },
+      },
+    });
+  }
+
   private async recalculateWarrantyClaimRate(technicianUserId: string | null): Promise<void> {
     if (!technicianUserId) return;
     const profile = await this.prisma.technicianProfile.findUnique({

@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next';
 import { Vazirmatn } from 'next/font/google';
+import { AppHeader } from '@/components/layout/AppHeader';
 import './globals.css';
 
 const vazirmatn = Vazirmatn({
@@ -23,7 +24,10 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="fa" dir="rtl">
-      <body className={`${vazirmatn.variable} min-h-screen font-sans`}>{children}</body>
+      <body className={`${vazirmatn.variable} min-h-screen font-sans`}>
+        <AppHeader />
+        {children}
+      </body>
     </html>
   );
 }
