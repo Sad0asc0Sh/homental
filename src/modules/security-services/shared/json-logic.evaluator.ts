@@ -24,6 +24,14 @@ addJsonLogicOperation('max', (...values: unknown[]) =>
 /** Shared JSON-Logic dialect for the Advisory AND Pricing engines (Invariant 4). */
 @Injectable()
 export class JsonLogicEvaluator {
+  evaluateString(rule: unknown, data: unknown): string {
+    const result: unknown = jsonLogicApply(rule as never, data as never);
+    if (typeof result !== 'string' || result.length === 0) {
+      throw new Error('JSON-Logic SKU evaluation must produce a nonempty string');
+    }
+    return result;
+  }
+
   /** Evaluates a rule document to a truthy/falsy boolean. */
   evaluateBoolean(rule: unknown, data: unknown): boolean {
     return Boolean(jsonLogicApply(rule as never, data as never));

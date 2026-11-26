@@ -66,12 +66,14 @@ describe('CitiesBranchesService — BRANCH_ADMIN isolation (Part B #5)', () => {
     const { service, prisma } = buildService();
     (prisma.branch.findUnique as jest.Mock).mockResolvedValue(ownBranch);
 
-    await service.updateBranch(branchAdmin, 'b1', { phone: '+989150000000' });
+    const result = await service.updateBranch(branchAdmin, 'b1', { phone: '+989150000000' });
 
     expect(prisma.branch.update).toHaveBeenCalledWith({
       where: { id: 'b1' },
       data: { phone: '+989150000000', addressFa: undefined, serviceRadiusMeters: undefined },
     });
+    expect(result).not.toHaveProperty('commissionRateOverride');
+    expect(result).not.toHaveProperty('warrantyReserveOverride');
   });
 
   it('a branch admin CANNOT modify commissionRateOverride of their own branch', async () => {
@@ -131,10 +133,14 @@ describe('CitiesBranchesService — BRANCH_ADMIN isolation (Part B #5)', () => {
 
   it('a branch admin listing branches sees ONLY their own branch', async () => {
     const { service, prisma } = buildService();
-    await service.listBranches(branchAdmin);
+    (prisma.branch.findMany as jest.Mock).mockResolvedValue([ownBranch]);
+    const result = await service.listBranches(branchAdmin);
     expect(prisma.branch.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { adminId: 'admin1' } }),
+      expect.objectContaining({ where: { id: 'b1', adminId: 'admin1' } }),
     );
+    expect(result).toMatchObject([{ id: 'b1', code: 'MSHD-C1' }]);
+    expect(result[0]).not.toHaveProperty('commissionRateOverride');
+    expect(result[0]).not.toHaveProperty('warrantyReserveOverride');
   });
 
   it('createBranch provisions the BRANCH wallet in the same transaction', async () => {

@@ -31,6 +31,7 @@ enum UserRole {
   TECHNICIAN
   BRANCH_ADMIN
   SUPER_ADMIN
+  SELLER
 }
 
 enum UserStatus {
@@ -111,6 +112,7 @@ enum WalletOwnerType {
   TECHNICIAN
   BRANCH
   PLATFORM
+  SELLER
 }
 
 enum WalletTransactionType {
@@ -123,6 +125,87 @@ enum WalletTransactionType {
   BRANCH_PAYOUT
   REFUND
   ADJUSTMENT
+  SELLER_PAYOUT
+  FULFILLMENT_ALLOCATION
+  SELLER_APP_FEE
+}
+
+enum SellerStatus {
+  PENDING_APPROVAL
+  APPROVED
+  SUSPENDED
+}
+
+enum ProductUnit {
+  EACH
+  METER
+}
+
+enum DeliveryMode {
+  BIKE
+  CAR
+}
+
+enum FulfillmentStatus {
+  RESERVED
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+}
+
+enum B2BSupplyOrderStatus {
+  FUNDED_RESERVED
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+}
+
+enum SupplierCaseType {
+  UNUSED_RETURN
+  EXCHANGE
+  REPAIR
+  TECH_GUIDANCE
+}
+
+enum SupplierCaseStatus {
+  OPEN
+  IN_REVIEW
+  APPROVED
+  INSPECTED_ACCEPTED
+  REJECTED
+  RESOLVED
+  CANCELLED
+}
+
+enum PriceRevisionStatus {
+  DRAFT
+  FUNDED
+  SUPERSEDED
+  CANCELLED
+}
+
+enum InvoiceBucket {
+  FIXED
+  SERVICE_PACKAGE
+  METERED
+}
+
+enum AddonKind {
+  MATERIAL
+  LABOR
+}
+
+enum EscrowPositionStatus {
+  OPEN
+  SETTLED
+  REFUNDED
+}
+
+enum MeteredAdjustmentStatus {
+  PENDING_APPROVAL
+  APPROVED
+  AUTO_REFUNDED
+  REJECTED
 }
 
 enum WalletTransactionStatus {
@@ -183,10 +266,13 @@ model User {
 
   customerProfile    CustomerProfile?
   technicianProfile  TechnicianProfile?
+  sellerProfile      SellerProfile?
   branchAdminFor     Branch?               @relation("BranchAdmin")
   notifications      Notification[]
   orders             ServiceOrder[]        @relation("CustomerOrders")
   assignedOrders     ServiceOrder[]        @relation("TechnicianOrders")
+  b2bSupplyOrders    B2BSupplyOrder[]
+  supplierCases      SupplierCase[]
   stateTransitions   OrderStateTransition[]
   reviews            Review[]              @relation("ReviewAuthor")
   otpCodes           OtpCode[]             @relation("UserOtpCodes")
@@ -280,6 +366,9 @@ model City {
   centerLat   Decimal @db.Decimal(9, 6)
   centerLng   Decimal @db.Decimal(10, 6)
   branches    Branch[]
+  sellers     SellerProfile[]
+  rateCards   InstallationRateCard[]
+  b2bSupplyOrders B2BSupplyOrder[]
   addresses   Address[]
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -307,8 +396,11 @@ model Branch {
   warrantyReserveOverride Decimal? @db.Decimal(5, 4) // null => warrantyReserveRate
   isActive            Boolean @default(true)
   technicians         TechnicianProfile[]
+  sellers             SellerProfile[]
+  rateCards           InstallationRateCard[]
   wallet              Wallet?
   orders              ServiceOrder[]
+  b2bSupplyOrders     B2BSupplyOrder[]
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
@@ -350,6 +442,9 @@ model Wallet {
   ownerId      String              @db.Uuid // polymorphic: User.id or Branch.id (PLATFORM uses a fixed constant)
   balance      BigInt              @default(0) // spendable amount
   heldInEscrow BigInt              @default(0) // locked for active orders
+  restrictedReserve     BigInt    @default(0)
+  restrictedFulfillment BigInt    @default(0)
+  escrowPositions       EscrowPosition[]
   currency     String              @default("TOMAN")
   transactions WalletTransaction[]
   branchId     String?             @unique @db.Uuid
@@ -368,6 +463,8 @@ model WalletTransaction {
   wallet         Wallet                 @relation(fields: [walletId], references: [id])
   orderId        String?                @db.Uuid
   order          ServiceOrder?          @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  b2bSupplyOrderId String?              @db.Uuid
+  b2bSupplyOrder B2BSupplyOrder?         @relation(fields: [b2bSupplyOrderId], references: [id], onDelete: Restrict)
   type           WalletTransactionType
   status         WalletTransactionStatus @default(SETTLED)
   amount         BigInt // signed: + credit / - debit
@@ -379,6 +476,7 @@ model WalletTransaction {
 
   @@index([walletId, createdAt])
   @@index([orderId])
+  @@index([b2bSupplyOrderId])
   @@index([type, status])
 }
 
@@ -521,6 +619,13 @@ model ServiceOrder {
   // Transparent pricing snapshot: { estimatedMin, estimatedMax, lines: [...],
   // surge: { multiplier, reason }, urgencyMultiplier, bundleDiscountPercent }
   pricing               Json?
+  pricingVersion        Int            @default(1)
+  activeRevision        Int            @default(1)
+  priceRevisions        OrderPriceRevision[]
+  meteredAdjustments    OrderMeteredAdjustment[]
+  supplierCases         SupplierCase[]
+  fulfillments          SupplyFulfillment[]
+  escrowPosition        EscrowPosition?
   surgeMultiplier       Decimal        @default(1) @db.Decimal(4, 2) // applies ONLY to labor+dispatch
   urgencyMultiplier     Decimal        @default(1) @db.Decimal(3, 2) // applies ONLY to labor+dispatch
   bundleDiscountPercent Int            @default(0) // 2 services = 6, 3+ = 10 (from PlatformConfig)
@@ -561,6 +666,7 @@ model OrderItem {
   supplyMode          SupplyMode?
   pricingSnapshot     Json? // per-item hardware/labor lines at estimate time
   hardwareUnits       HardwareUnit[]
+  addons              OrderAddon[]
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
@@ -580,6 +686,10 @@ model DispatchOffer {
   technicianId    String               @db.Uuid
   technician      TechnicianProfile    @relation(fields: [technicianId], references: [id])
   status          DispatchOfferStatus  @default(PENDING)
+  attempt         Int                  @default(1)
+  wave            Int                  @default(1)
+  audience        String               @default("ALL")
+  isBranchInvite  Boolean              @default(false)
   radiusMeters    Int // dispatch ring the offer was sent in
   distanceMeters  Int? // from Redis GEO at offer time
   score           Decimal              @db.Decimal(5, 2) // weighted total, 0–100
@@ -596,7 +706,7 @@ model DispatchOffer {
   createdAt       DateTime             @default(now())
   updatedAt       DateTime             @updatedAt
 
-  @@unique([orderId, technicianId]) // one offer wave per technician per order
+  @@unique([orderId, attempt, wave, technicianId])
   @@index([orderId, status])
   @@index([technicianId, status])
   @@index([status, expiresAt]) // sweeper for expired-but-unresponded offers
@@ -610,6 +720,9 @@ model HardwareUnit {
   id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   orderItemId       String    @db.Uuid
   orderItem         OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  orderAddonId      String?     @db.Uuid
+  orderAddon        OrderAddon? @relation(fields: [orderAddonId], references: [id], onDelete: SetNull)
+  sku               String?
   categoryFa        String // "دوربین", "سنسور درب", "موتور کرکره"
   brand             String?
   model             String?
@@ -618,6 +731,259 @@ model HardwareUnit {
   registeredByUserId String?  @db.Uuid
 
   @@index([orderItemId])
+  @@index([orderAddonId])
+}
+
+model SellerProfile {
+  id               String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String          @unique @db.Uuid
+  user             User            @relation(fields: [userId], references: [id])
+  cityId           String          @db.Uuid
+  city             City            @relation(fields: [cityId], references: [id])
+  branchId         String          @db.Uuid
+  branch           Branch          @relation(fields: [branchId], references: [id])
+  shopNameFa       String
+  status           SellerStatus    @default(PENDING_APPROVAL)
+  sellerAppFeeFlat BigInt          @default(0)
+  addressFa        String
+  phone            String?
+  lat              Decimal         @db.Decimal(9, 6)
+  lng              Decimal         @db.Decimal(10, 6)
+  offers           SellerOffer[]
+  fulfillments     SupplyFulfillment[]
+  supplierCases    SupplierCase[]
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@index([cityId, status])
+  @@index([branchId])
+}
+
+model Product {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sku            String        @unique
+  serviceKey     ServiceKey
+  titleFa        String
+  unit           ProductUnit   @default(EACH)
+  requiresSerial Boolean       @default(true)
+  weightGrams    Int           @default(500)
+  volumeCm3      Int           @default(1000)
+  handlingClass  String        @default("STANDARD")
+  specs          Json?
+  isActive       Boolean       @default(true)
+  offers         SellerOffer[]
+}
+
+model SellerOffer {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sellerId     String        @db.Uuid
+  seller       SellerProfile @relation(fields: [sellerId], references: [id])
+  productId    String        @db.Uuid
+  product      Product       @relation(fields: [productId], references: [id])
+  sellerSku    String
+  partnerPrice BigInt
+  onHandQty    Int           @default(0)
+  reservedQty  Int           @default(0)
+  isActive     Boolean       @default(true)
+  version      Int           @default(1)
+  addons       OrderAddon[]
+
+  @@unique([sellerId, sellerSku])
+  @@index([productId, isActive])
+}
+
+model InstallationRateCard {
+  id                    String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code                  String       @unique
+  serviceKey            ServiceKey
+  cityId                String?      @db.Uuid
+  city                  City?        @relation(fields: [cityId], references: [id])
+  branchId              String?      @db.Uuid
+  branch                Branch?      @relation(fields: [branchId], references: [id])
+  version               Int          @default(1)
+  standardMinutes       Int
+  hourlyRate            BigInt
+  effortBps             Int          @default(10000)
+  physicalDifficultyBps Int          @default(10000)
+  technicalDifficultyBps Int         @default(10000)
+  meteredLaborPerMeter   BigInt       @default(0)
+  normalAllowance       BigInt
+  minVisitWage          BigInt
+  isActive              Boolean      @default(true)
+  addons                OrderAddon[]
+
+  @@index([serviceKey, cityId, branchId, isActive])
+}
+
+model OrderPriceRevision {
+  id                  String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId             String              @db.Uuid
+  order               ServiceOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  revision            Int
+  pricingVersion      Int
+  status              PriceRevisionStatus
+  policyVersion       String
+  bundleBps           Int
+  sliderBps           Int                 @default(0)
+  customerViewJson    Json
+  technicianTermsJson Json
+  internalSplitJson   Json
+  expiresAt           DateTime?
+  addons              OrderAddon[]
+
+  @@unique([orderId, revision])
+}
+
+model OrderMeteredAdjustment {
+  id                 String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId            String                  @db.Uuid
+  order              ServiceOrder            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  baseRevision       Int
+  resultingRevision  Int?
+  status             MeteredAdjustmentStatus @default(PENDING_APPROVAL)
+  submittedByUserId  String                  @db.Uuid
+  readingsJson       Json
+  deltaAmount        BigInt
+  idempotencyKey     String?                 @unique
+  customerDecidedAt  DateTime?
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+
+  @@index([orderId, createdAt])
+}
+
+model OrderAddon {
+  id            String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  revisionId    String                @db.Uuid
+  revision      OrderPriceRevision    @relation(fields: [revisionId], references: [id], onDelete: Cascade)
+  lineKey       String
+  bucket        InvoiceBucket
+  kind          AddonKind
+  orderItemId   String?               @db.Uuid
+  orderItem     OrderItem?            @relation(fields: [orderItemId], references: [id], onDelete: SetNull)
+  fulfillmentId String?               @db.Uuid
+  fulfillment   SupplyFulfillment?    @relation(fields: [fulfillmentId], references: [id], onDelete: SetNull)
+  sellerOfferId String?               @db.Uuid
+  sellerOffer   SellerOffer?          @relation(fields: [sellerOfferId], references: [id])
+  rateCardId    String?               @db.Uuid
+  rateCard      InstallationRateCard? @relation(fields: [rateCardId], references: [id])
+  sku           String?
+  titleFa       String
+  unit          ProductUnit
+  qty           Int
+  /// Exact billable length. Metered stock is reserved in whole meters using qty.
+  quantityCm    Int?
+  unitPrice     BigInt
+  lineTotal     BigInt
+  hardwareUnits HardwareUnit[]
+
+  @@unique([revisionId, lineKey])
+  @@index([fulfillmentId])
+}
+
+model B2BSupplyOrder {
+  id                 String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderNumber        String               @unique
+  technicianUserId   String               @db.Uuid
+  technician         User                 @relation(fields: [technicianUserId], references: [id])
+  cityId             String               @db.Uuid
+  city               City                 @relation(fields: [cityId], references: [id])
+  branchId           String               @db.Uuid
+  branch             Branch               @relation(fields: [branchId], references: [id])
+  deliveryAddressFa  String
+  lat                Decimal              @db.Decimal(9, 6)
+  lng                Decimal              @db.Decimal(10, 6)
+  status             B2BSupplyOrderStatus @default(FUNDED_RESERVED)
+  goodsTotal         BigInt
+  freightTotal       BigInt
+  grandTotal         BigInt
+  linesJson          Json
+  fulfillments       SupplyFulfillment[]
+  escrowPosition     EscrowPosition?
+  transactions       WalletTransaction[]
+  supplierCases      SupplierCase[]
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  @@index([technicianUserId, createdAt])
+  @@index([cityId, createdAt])
+  @@index([branchId, createdAt])
+}
+
+model SupplierCase {
+  id                 String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  caseNumber         String             @unique
+  type               SupplierCaseType
+  status             SupplierCaseStatus @default(OPEN)
+  technicianUserId   String             @db.Uuid
+  technician         User               @relation(fields: [technicianUserId], references: [id])
+  sellerId           String             @db.Uuid
+  seller             SellerProfile      @relation(fields: [sellerId], references: [id])
+  fulfillmentId      String?            @db.Uuid
+  fulfillment        SupplyFulfillment? @relation(fields: [fulfillmentId], references: [id], onDelete: Restrict)
+  b2bSupplyOrderId    String?            @db.Uuid
+  b2bSupplyOrder      B2BSupplyOrder?    @relation(fields: [b2bSupplyOrderId], references: [id], onDelete: Restrict)
+  serviceOrderId      String?            @db.Uuid
+  serviceOrder        ServiceOrder?      @relation(fields: [serviceOrderId], references: [id], onDelete: Restrict)
+  lineKey            String?
+  sku                String?
+  serialNumber       String?
+  requestedQty       Int?
+  approvedQty        Int?
+  replacementOfferId String?            @db.Uuid
+  priceDelta         BigInt?
+  sealIntact         Boolean?
+  reasonFa           String
+  inspectionNoteFa   String?
+  messagesJson       Json?
+  refundAmount       BigInt?
+  idempotencyKey     String?            @unique
+  resolvedAt         DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@index([technicianUserId, createdAt])
+  @@index([sellerId, createdAt])
+  @@index([fulfillmentId, lineKey, status])
+}
+
+model SupplyFulfillment {
+  id           String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId      String?           @db.Uuid
+  order        ServiceOrder?     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  b2bSupplyOrderId String?       @db.Uuid
+  b2bSupplyOrder B2BSupplyOrder? @relation(fields: [b2bSupplyOrderId], references: [id], onDelete: Restrict)
+  sellerId     String            @db.Uuid
+  seller       SellerProfile     @relation(fields: [sellerId], references: [id])
+  deliveryMode DeliveryMode
+  freightCost  BigInt
+  sellerAppFee BigInt?
+  status       FulfillmentStatus @default(RESERVED)
+  notesFa      String?
+  lines        OrderAddon[]
+  supplierCases SupplierCase[]
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  @@index([orderId])
+  @@unique([b2bSupplyOrderId, sellerId])
+  @@index([sellerId, createdAt])
+}
+
+model EscrowPosition {
+  id             String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId        String?              @unique @db.Uuid
+  order          ServiceOrder?        @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  b2bSupplyOrderId String?            @unique @db.Uuid
+  b2bSupplyOrder B2BSupplyOrder?       @relation(fields: [b2bSupplyOrderId], references: [id], onDelete: Restrict)
+  payerWalletId  String               @db.Uuid
+  payerWallet    Wallet               @relation(fields: [payerWalletId], references: [id])
+  heldAmount     BigInt
+  settledAmount  BigInt               @default(0)
+  activeRevision Int
+  status         EscrowPositionStatus @default(OPEN)
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
 }
 
 model Warranty {

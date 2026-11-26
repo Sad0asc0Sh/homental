@@ -98,27 +98,35 @@ export interface SmartBrief {
   missingPillars: string[];
 }
 
-export interface PricingLine {
-  ref?: string;
-  labelFa: string;
-  qty?: number;
-  unitPrice?: number;
-  lineTotal?: string;
-  amount?: string;
+export interface InvoiceLine {
+  lineKey: string;
+  sku?: string | null;
+  titleFa: string;
+  unit: 'EACH' | 'METER';
+  qty: number;
+  quantityCm?: number | null;
+  unitPrice: string;
+  lineTotal: string;
 }
 
-export interface PricingItemBreakdown {
-  serviceKey: ServiceKey;
-  titleFa: string;
-  supplyMode: SupplyMode;
-  hardwareDropped: boolean;
-  hardwareLines: PricingLine[];
-  hardwareSubtotal: string;
-  laborLines: PricingLine[];
-  appliedComplexities: Array<{ labelFa: string; multiplier: number }>;
-  laborSubtotal: string;
-  dispatchFee: string;
-  itemBaseSubtotal: string;
+export interface BargainingSlider {
+  sliderBps: number;
+  minDeltaBps: number;
+  maxDeltaBps: number;
+  priorityThresholdBps: number;
+  packageBaseAmount: string;
+  dispatchAudience: 'TOP' | 'ALL';
+}
+
+export interface ManagedInvoice {
+  buckets: Array<{
+    bucket: 'FIXED' | 'SERVICE_PACKAGE' | 'METERED';
+    titleFa: string;
+    badgeFa?: string;
+    subtotal: string;
+    lines: InvoiceLine[];
+  }>;
+  total: string;
 }
 
 export interface PricingResult {
@@ -126,19 +134,16 @@ export interface PricingResult {
   estimatedMin: string;
   estimatedMax: string;
   netEstimated: string;
+  invoice: ManagedInvoice;
+  slider?: BargainingSlider | null;
   summary: {
     totalHardware: string;
-    totalBaseLabor: string;
-    totalBaseDispatch: string;
-    dynamicLaborAndDispatch: string;
     bundleDiscountPercent: number;
-    bundleDiscountAmount: string;
   };
   factors: {
-    surge: { multiplier: number; activeTechs: number; pendingOrders: number; reasonFa: string };
+    surge: { multiplier: number; reasonFa: string };
     urgency: { urgency: UrgencyLevel; multiplier: number };
   };
-  items: PricingItemBreakdown[];
 }
 
 export interface EvaluateResponse {

@@ -1,4 +1,4 @@
-import { Global, Module, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
+import { Global, Module, type OnModuleInit } from '@nestjs/common';
 import { RedisService } from '@infra/redis/redis.service';
 import { RealtimeEvent } from './realtime.service';
 import { RealtimeGateway } from './realtime.gateway';
@@ -15,7 +15,7 @@ import { RealtimeService } from './realtime.service';
   providers: [RealtimeService, RealtimeGateway],
   exports: [RealtimeService],
 })
-export class RealtimeModule implements OnModuleInit, OnModuleDestroy {
+export class RealtimeModule implements OnModuleInit {
   constructor(
     private readonly redis: RedisService,
     private readonly realtimeService: RealtimeService,
@@ -26,9 +26,5 @@ export class RealtimeModule implements OnModuleInit, OnModuleDestroy {
       const userId = channel.replace('notifications:user:', '');
       this.realtimeService.emitToUser(userId, RealtimeEvent.NOTIFICATION, { raw: message });
     });
-  }
-
-  async onModuleDestroy(): Promise<void> {
-    await this.redis.unsubscribePattern('notifications:user:*');
   }
 }

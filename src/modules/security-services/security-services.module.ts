@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { NotificationsModule } from '@modules/notifications/notifications.module';
 import { WalletEscrowModule } from '@modules/wallet-escrow/wallet-escrow.module';
 import { AdminCatalogController } from './catalog/admin-catalog.controller';
 import { CatalogController } from './catalog/catalog.controller';
@@ -11,6 +12,8 @@ import { DispatchController } from './dispatch/dispatch.controller';
 import { DispatchService } from './dispatch/dispatch.service';
 import { DispatchSweeperService } from './dispatch/dispatch-sweeper.service';
 import { OrdersController } from './orders/orders.controller';
+import { MeteredAdjustmentsController } from './orders/metered-adjustments.controller';
+import { MeteredAdjustmentsService } from './orders/metered-adjustments.service';
 import { OrdersService } from './orders/orders.service';
 import { DynamicFactorsService } from './pricing/dynamic-factors.service';
 import { PricingController } from './pricing/pricing.controller';
@@ -29,7 +32,9 @@ import { JsonLogicEvaluator } from './shared/json-logic.evaluator';
  * import this. Dispatch/Handover/Warranty complete the Snapp-like lifecycle.
  */
 @Module({
-  imports: [WalletEscrowModule],
+  // Orders/Dispatch/Warranty inject NotificationsService — the core
+  // NotificationsModule must be imported here for Nest DI to see it.
+  imports: [NotificationsModule, WalletEscrowModule],
   controllers: [
     CatalogController,
     AdminCatalogController,
@@ -38,6 +43,7 @@ import { JsonLogicEvaluator } from './shared/json-logic.evaluator';
     AdminAdvisoryRulesController,
     PricingController,
     OrdersController,
+    MeteredAdjustmentsController,
     DispatchController,
     WarrantyController,
     AdminWarrantyClaimsController,
@@ -51,6 +57,7 @@ import { JsonLogicEvaluator } from './shared/json-logic.evaluator';
     DynamicFactorsService,
     PricingService,
     OrdersService,
+    MeteredAdjustmentsService,
     DispatchService,
     DispatchSweeperService,
     WarrantyService,

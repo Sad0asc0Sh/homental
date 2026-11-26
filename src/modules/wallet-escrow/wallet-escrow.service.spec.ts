@@ -10,7 +10,13 @@ interface WalletRow {
   ownerId: string;
   balance: bigint;
   heldInEscrow: bigint;
+  restrictedReserve: bigint;
 }
+
+type WalletUpdate = {
+  where: { id: string; balance?: { gte?: bigint }; heldInEscrow?: { gte?: bigint } };
+  data: Partial<Record<'balance' | 'heldInEscrow' | 'restrictedReserve', { increment?: bigint; decrement?: bigint }>>;
+};
 
 function buildService(splitConfig?: { platformCommissionRate: number; warrantyReserveRate: number }) {
   const customerWallet: WalletRow = {
@@ -19,6 +25,7 @@ function buildService(splitConfig?: { platformCommissionRate: number; warrantyRe
     ownerId: 'c1',
     balance: 10_000_000n,
     heldInEscrow: 0n,
+    restrictedReserve: 0n,
   };
   const technicianWallet: WalletRow = {
     id: 'w-tech',
@@ -26,6 +33,7 @@ function buildService(splitConfig?: { platformCommissionRate: number; warrantyRe
     ownerId: 't1',
     balance: 0n,
     heldInEscrow: 0n,
+    restrictedReserve: 0n,
   };
   const platformWallet: WalletRow = {
     id: 'w-platform',
@@ -33,9 +41,19 @@ function buildService(splitConfig?: { platformCommissionRate: number; warrantyRe
     ownerId: PLATFORM_ID,
     balance: 0n,
     heldInEscrow: 0n,
+    restrictedReserve: 0n,
   };
   const all = [customerWallet, technicianWallet, platformWallet];
   const createdTxes: Array<Record<string, unknown>> = [];
+
+  function applyWalletUpdate({ where, data }: WalletUpdate) {
+    const row = all.find((candidate) => candidate.id === where.id);
+    if (!row || row.balance < (where.balance?.gte ?? 0n) || row.heldInEscrow < (where.heldInEscrow?.gte ?? 0n)) return [];
+    for (const field of ['balance', 'heldInEscrow', 'restrictedReserve'] as const) {
+      row[field] += (data[field]?.increment ?? 0n) - (data[field]?.decrement ?? 0n);
+    }
+    return [{ ...row }];
+  }
 
   const wallet = {
     // Return COPIES (like Prisma rows) so balanceAfter math stays pre-mutation.
@@ -45,35 +63,9 @@ function buildService(splitConfig?: { platformCommissionRate: number; warrantyRe
       );
       return found ? { ...found } : null;
     }),
-    update: jest.fn(async ({ where, data }: { where: { id: string }; data: { balance?: { increment?: bigint; decrement?: bigint } } }) => {
-      const row = all.find((w) => w.id === where.id) as WalletRow;
-      if (data.balance?.increment) row.balance += data.balance.increment;
-      if (data.balance?.decrement) row.balance -= data.balance.decrement;
-      return { ...row };
-    }),
-    updateMany: jest.fn(
-      async ({
-        where,
-        data,
-      }: {
-        where: { id: string; balance?: { gte?: bigint }; heldInEscrow?: { gte?: bigint } };
-        data: {
-          balance?: { increment?: bigint; decrement?: bigint };
-          heldInEscrow?: { increment?: bigint; decrement?: bigint };
-        };
-      }) => {
-        const row = all.find((w) => w.id === where.id) as WalletRow;
-        if (where.balance?.gte !== undefined && row.balance < where.balance.gte) return { count: 0 };
-        if (where.heldInEscrow?.gte !== undefined && row.heldInEscrow < where.heldInEscrow.gte) {
-          return { count: 0 };
-        }
-        if (data.balance?.increment) row.balance += data.balance.increment;
-        if (data.balance?.decrement) row.balance -= data.balance.decrement;
-        if (data.heldInEscrow?.increment) row.heldInEscrow += data.heldInEscrow.increment;
-        if (data.heldInEscrow?.decrement) row.heldInEscrow -= data.heldInEscrow.decrement;
-        return { count: 1 };
-      },
-    ),
+    update: jest.fn(async (input: WalletUpdate) => applyWalletUpdate(input)[0]),
+    updateMany: jest.fn(async (input: WalletUpdate) => ({ count: applyWalletUpdate(input).length })),
+    updateManyAndReturn: jest.fn(async (input: WalletUpdate) => applyWalletUpdate(input)),
     upsert: jest.fn(async () => ({ ...platformWallet })),
   };
 
@@ -169,7 +161,7 @@ describe('WalletEscrowService — refundEscrow', () => {
 });
 
 describe('WalletEscrowService — releaseEscrowAndSplit (zero-drift BigInt split)', () => {
-  it('splits 1,000,000 with default 15%/5% → 150k commission + 50k reserve + 850k payout', async () => {
+  it('splits 1,000,000 with default 15%/5% → 150k commission + 50k reserve + 800k payout', async () => {
     const { service, platformWallet, technicianWallet, customerWallet, createdTxes } = buildService();
     await seedHold(service);
     const result = await service.releaseEscrowAndSplit({
@@ -188,7 +180,8 @@ describe('WalletEscrowService — releaseEscrowAndSplit (zero-drift BigInt split
     // Zero-drift invariant
     expect(result.platformCommission + result.warrantyReserve + result.technicianPayout).toBe(1_000_000n);
 
-    expect(platformWallet.balance).toBe(200_000n); // commission + reserve ledger
+    expect(platformWallet.balance).toBe(150_000n);
+    expect(platformWallet.restrictedReserve).toBe(50_000n);
     expect(technicianWallet.balance).toBe(800_000n);
     expect(customerWallet.heldInEscrow).toBe(0n);
 
@@ -246,7 +239,8 @@ describe('WalletEscrowService — releaseEscrowAndSplit (zero-drift BigInt split
     const replay = await service.releaseEscrowAndSplit(params);
 
     expect(replay).toEqual(first);
-    expect(platformWallet.balance).toBe(200_000n); // credited exactly once
+    expect(platformWallet.balance).toBe(150_000n);
+    expect(platformWallet.restrictedReserve).toBe(50_000n);
     expect(technicianWallet.balance).toBe(800_000n);
   });
 });

@@ -1,5 +1,6 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { UserRole } from '@prisma/client';
+import type { Branch } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import { PrismaService } from '@infra/prisma/prisma.service';
 import type { CreateBranchDto, CreateCityDto, UpdateBranchDto, UpdateCityDto } from './dto/cities-branches.dto';
@@ -18,6 +19,15 @@ const PUBLIC_BRANCH_SELECT = {
 
 /** Fields a BRANCH_ADMIN may change on their own branch. */
 const BRANCH_ADMIN_ALLOWED_FIELDS = new Set(['phone', 'addressFa', 'serviceRadiusMeters']);
+
+function toBranchOperationsView(branch: Branch & { city?: { id: string; slug: string; nameFa: string } }) {
+  const { id, code, cityId, adminId, nameFa, addressFa, phone, lat, lng, serviceRadiusMeters,
+    hasPhysicalShowroom, isActive, createdAt, updatedAt, city } = branch;
+  return {
+    id, code, cityId, adminId, nameFa, addressFa, phone, lat, lng, serviceRadiusMeters,
+    hasPhysicalShowroom, isActive, createdAt, updatedAt, city,
+  };
+}
 
 @Injectable()
 export class CitiesBranchesService {
@@ -117,12 +127,15 @@ export class CitiesBranchesService {
 
   async listBranches(actor: AuthenticatedUser) {
     if (actor.role === UserRole.BRANCH_ADMIN) {
-      return this.prisma.branch.findMany({
-        where: { adminId: actor.id },
+      if (!actor.branchId) return [];
+      const branches = await this.prisma.branch.findMany({
+        where: { id: actor.branchId, adminId: actor.id },
         orderBy: { createdAt: 'asc' },
         include: { city: { select: { id: true, slug: true, nameFa: true } } },
       });
+      return branches.map(toBranchOperationsView);
     }
+    if (actor.role !== UserRole.SUPER_ADMIN) throw new ForbiddenException();
     return this.prisma.branch.findMany({
       orderBy: { createdAt: 'asc' },
       include: { city: { select: { id: true, slug: true, nameFa: true } } },
@@ -130,13 +143,16 @@ export class CitiesBranchesService {
   }
 
   async updateBranch(actor: AuthenticatedUser, branchId: string, dto: UpdateBranchDto) {
+    if (actor.role !== UserRole.BRANCH_ADMIN && actor.role !== UserRole.SUPER_ADMIN) {
+      throw new ForbiddenException();
+    }
     const branch = await this.prisma.branch.findUnique({ where: { id: branchId } });
     if (!branch) {
       throw new NotFoundException({ statusCode: 404, message: 'شعبه یافت نشد.' });
     }
 
     if (actor.role === UserRole.BRANCH_ADMIN) {
-      if (branch.adminId !== actor.id) {
+      if (branch.id !== actor.branchId || branch.adminId !== actor.id) {
         throw new ForbiddenException({
           statusCode: 403,
           message: 'شما فقط مجاز به مدیریت شعبه خودتان هستید.',
@@ -155,7 +171,7 @@ export class CitiesBranchesService {
             'تغییر نرخ کمیسیون، ذخیره گارانتی، نمایشگاه فیزیکی یا داده‌های پایه شعبه فقط توسط ابرادمین سامانه ممکن است.',
         });
       }
-      return this.prisma.branch.update({
+      const updated = await this.prisma.branch.update({
         where: { id: branchId },
         data: {
           phone: dto.phone ?? undefined,
@@ -163,6 +179,7 @@ export class CitiesBranchesService {
           serviceRadiusMeters: dto.serviceRadiusMeters ?? undefined,
         },
       });
+      return toBranchOperationsView(updated);
     }
 
     // SUPER_ADMIN: full update (undefined = leave untouched, null = clear).

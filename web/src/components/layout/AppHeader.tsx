@@ -1,15 +1,16 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LogIn, LogOut, MapPin, ShieldCheck, Wrench } from 'lucide-react';
+import { LogIn, LogOut, MapPin, ShieldCheck } from 'lucide-react';
 import { AuthModal } from '@/components/brief/AuthModal';
 import { useAuthStore } from '@/store/auth.store';
 
 const ROLE_BADGES: Record<string, { labelFa: string; className: string }> = {
   CUSTOMER: { labelFa: 'مشتری', className: 'bg-emerald-50 text-emerald-700' },
   TECHNICIAN: { labelFa: 'نصاب', className: 'bg-sky-50 text-sky-700' },
+  SELLER: { labelFa: 'فروشنده', className: 'bg-amber-50 text-amber-800' },
   BRANCH_ADMIN: { labelFa: 'مدیر شعبه', className: 'bg-primary-50 text-primary-700' },
   SUPER_ADMIN: { labelFa: 'ابرادمین', className: 'bg-primary-900 text-white' },
 };
@@ -24,7 +25,12 @@ const CUSTOMER_NAV: Array<{ href: string; labelFa: string }> = [
 const NAV_BY_ROLE: Record<string, Array<{ href: string; labelFa: string }>> = {
   guest: CUSTOMER_NAV,
   CUSTOMER: CUSTOMER_NAV,
-  TECHNICIAN: [{ href: '/technician', labelFa: 'پنل نصاب' }],
+  TECHNICIAN: [
+    { href: '/technician', labelFa: 'پنل نصاب' },
+    { href: '/technician/supply', labelFa: 'تأمین کالا و خدمات همکار' },
+    { href: '/wallet', labelFa: 'کیف پول' },
+  ],
+  SELLER: [{ href: '/seller', labelFa: 'پنل فروشنده' }, { href: '/wallet', labelFa: 'کیف پول' }],
   BRANCH_ADMIN: [{ href: '/branch', labelFa: 'پنل مدیریت شعبه' }],
   SUPER_ADMIN: [
     { href: '/admin', labelFa: 'پنل مدیریت کل' },
@@ -37,6 +43,14 @@ export function AppHeader() {
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
   const [authOpen, setAuthOpen] = useState(false);
+
+  // Bulletproof hydration flag: zustand v4's onRehydrateStorage callback can
+  // be skipped when localStorage is empty (first visit), which left
+  // hasHydrated false forever and froze every authed page on its spinner.
+  // Flipping it after the first client mount guarantees progress everywhere.
+  useEffect(() => {
+    useAuthStore.getState().setHasHydrated();
+  }, []);
 
   const role = user?.role ?? 'guest';
   const nav = NAV_BY_ROLE[role] ?? NAV_BY_ROLE['guest'];
@@ -114,12 +128,6 @@ export function AppHeader() {
               {item.labelFa}
             </Link>
           ))}
-          {role === 'TECHNICIAN' ? (
-            <span className="flex items-center gap-1 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs text-slate-400">
-              <Wrench size={13} />
-              ابزار نصب
-            </span>
-          ) : null}
           {role === 'BRANCH_ADMIN' ? (
             <span className="flex items-center gap-1 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs text-slate-400">
               <MapPin size={13} />

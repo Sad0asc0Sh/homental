@@ -1,9 +1,11 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, GoneException, NotFoundException } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { UserRole } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import type { PrismaService } from '@infra/prisma/prisma.service';
-import type { PricingEstimateResult } from '../pricing/pricing.service';
+import { computeServicePackage, MANAGED_PRICING_VERSION, toSliderView } from '../pricing/managed-pricing';
+import type { PricingService } from '../pricing/pricing.service';
+import { jsonSnapshot } from './managed-order-economics';
 import { OrdersService } from './orders.service';
 
 const customer = { id: 'c1', phone: '+989120000020', role: UserRole.CUSTOMER, branchId: null } as AuthenticatedUser;
@@ -12,39 +14,31 @@ const branchAdmin = { id: 'a1', phone: '+989120000002', role: UserRole.BRANCH_AD
 const otherBranchAdmin = { id: 'a2', phone: '+989120000003', role: UserRole.BRANCH_ADMIN, branchId: 'b2' } as AuthenticatedUser;
 const superAdmin = { id: 'sa1', phone: '+989120000001', role: UserRole.SUPER_ADMIN, branchId: null } as AuthenticatedUser;
 
+const servicePackage = computeServicePackage(400_000n, 0n, 100_000n, 1000n, 0n);
+const amount = servicePackage.price;
+const packageLine = {
+  lineKey: 'service-package', titleFa: 'بسته اجرا', qty: 1, unit: 'EACH' as const,
+  unitPrice: amount, lineTotal: amount,
+};
 const cannedEstimate = {
-  currency: 'TOMAN',
-  estimatedMin: 1_800_000n,
-  estimatedMax: 2_400_000n,
-  netEstimated: 2_000_000n,
-  summary: {
-    totalHardware: 1_500_000n,
-    totalBaseLabor: 400_000n,
-    totalBaseDispatch: 100_000n,
-    dynamicLaborAndDispatch: 500_000n,
-    bundleDiscountPercent: 0,
-    bundleDiscountAmount: 0n,
-  },
-  factors: {
-    surge: { multiplier: 1, activeTechs: 0, pendingOrders: 0, reasonFa: 'تعرفه عادی' },
-    urgency: { urgency: 'SCHEDULED', multiplier: 1 },
-  },
-  items: [
-    {
-      serviceKey: 'ALARM',
-      titleFa: 'دزدگیر اماکن',
-      supplyMode: 'FULL_PACKAGE',
-      hardwareDropped: false,
-      hardwareLines: [],
-      hardwareSubtotal: 1_500_000n,
-      laborLines: [],
-      appliedComplexities: [],
-      laborSubtotal: 400_000n,
-      dispatchFee: 100_000n,
-      itemBaseSubtotal: 2_000_000n,
+  customerView: {
+    currency: 'TOMAN', estimatedMin: amount, estimatedMax: amount, netEstimated: amount,
+    slider: toSliderView(servicePackage, 500),
+    invoice: {
+      total: amount,
+      buckets: [{ bucket: 'SERVICE_PACKAGE', titleFa: packageLine.titleFa, subtotal: amount, lines: [packageLine] }],
     },
-  ],
-} as unknown as PricingEstimateResult;
+    summary: { totalHardware: 0n, bundleDiscountPercent: 0 },
+    factors: {
+      surge: { multiplier: 1, reasonFa: 'تعرفه عادی' },
+      urgency: { urgency: 'SCHEDULED', multiplier: 1 },
+    },
+  },
+  materials: [], labor: [],
+  tasks: [{ serviceKey: 'ALARM', titleFa: 'دزدگیر اماکن', supplyMode: 'INSTALL_ONLY', rateCardId: 'rate1', rateCardVersion: 1 }],
+  internalSplit: { servicePackage, shipments: [], meteredLabor: 0n, total: amount },
+  bundleBps: 0, policyVersion: 'test-v1', packageLine,
+} satisfies Awaited<ReturnType<PricingService['estimateManaged']>>;
 
 type OrderRow = Record<string, unknown> & { id: string; state: string };
 
@@ -58,6 +52,7 @@ function buildService(orderFixture?: OrderRow) {
       findUnique: jest.fn().mockResolvedValue({
         id: 'addr1',
         customerId: 'cp1',
+        cityId: 'city1',
         locationType: 'APARTMENT',
         lat: 36.3,
         lng: 59.6,
@@ -70,10 +65,11 @@ function buildService(orderFixture?: OrderRow) {
       findMany: jest.fn().mockResolvedValue([{ id: 'def-alarm', key: 'ALARM' }]),
     },
     serviceOrder: {
-      create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => ({
-        id: 'o1',
-        ...data,
-      })),
+      create: jest.fn(async ({ data }: { data: Record<string, unknown> & { state: string } }) => {
+        currentOrder = { id: 'o1', items: [], priceRevisions: [], ...data };
+        return currentOrder;
+      }),
+      findUniqueOrThrow: jest.fn(async () => currentOrder),
       findUnique: jest.fn(async (_args?: { where: { id: string } }) =>
         currentOrder ? { ...currentOrder } : null,
       ),
@@ -91,7 +87,19 @@ function buildService(orderFixture?: OrderRow) {
         return currentOrder;
       }),
     },
-    orderItem: { create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => data) },
+    orderItem: { create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => ({ ...data, id: 'item1' })) },
+    orderPriceRevision: {
+      create: jest.fn().mockResolvedValue({ id: 'rev1' }),
+      findUnique: jest.fn().mockResolvedValue({
+        id: 'rev1', status: 'DRAFT', pricingVersion: MANAGED_PRICING_VERSION, sliderBps: 0,
+        internalSplitJson: jsonSnapshot({ ...cannedEstimate.internalSplit, offerVersions: {} }),
+        addons: [{ ...packageLine, sellerOfferId: null }],
+      }),
+      update: jest.fn().mockResolvedValue({}),
+    },
+    orderAddon: { createMany: jest.fn().mockResolvedValue({ count: 1 }) },
+    escrowPosition: { create: jest.fn().mockResolvedValue({}), findUnique: jest.fn() },
+    dispatchOffer: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
     orderStateTransition: {
       create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => data),
       createMany: jest.fn(async ({ data }: { data: Array<Record<string, unknown>> }) => ({ count: data.length })),
@@ -102,13 +110,16 @@ function buildService(orderFixture?: OrderRow) {
     $transaction: jest.fn(async (fn: (tx: unknown) => unknown) => fn(prisma)),
   } as unknown as PrismaService;
 
-  const pricingService = { estimate: jest.fn().mockResolvedValue(cannedEstimate) };
-  const walletEscrowService = { holdEscrow: jest.fn().mockResolvedValue({}), refundEscrow: jest.fn().mockResolvedValue({}) };
+  const pricingService = { estimateManaged: jest.fn().mockResolvedValue(cannedEstimate) };
+  const walletEscrowService = {
+    holdEscrow: jest.fn().mockResolvedValue({ walletId: 'wallet1' }),
+    refundEscrow: jest.fn().mockResolvedValue({}),
+  };
   const notificationsService = { send: jest.fn().mockResolvedValue({}) };
 
   const service = new OrdersService(
     prisma,
-    pricingService as unknown as import('../pricing/pricing.service').PricingService,
+    pricingService as unknown as PricingService,
     walletEscrowService as unknown as import('@modules/wallet-escrow/wallet-escrow.service').WalletEscrowService,
     notificationsService as unknown as import('@modules/notifications/notifications.service').NotificationsService,
     new EventEmitter2(),
@@ -137,11 +148,11 @@ describe('OrdersService — creation with pricing snapshot (ESTIMATED)', () => {
       addressId: 'addr1',
       urgency: 'SCHEDULED',
       supplyMode: 'FULL_PACKAGE',
-      items: [{ serviceKey: 'ALARM', config: { petImmune: true } }],
+      items: [{ serviceKey: 'ALARM', supplyMode: 'INSTALL_ONLY', config: { petImmune: true } }],
     });
 
     expect(result.order['orderNumber']).toMatch(/^HM-\d{4}-\d{6}$/);
-    expect(pricingService.estimate).toHaveBeenCalledWith(
+    expect(pricingService.estimateManaged).toHaveBeenCalledWith(
       expect.objectContaining({
         citySlug: 'mashhad',
         lat: 36.3,
@@ -149,6 +160,7 @@ describe('OrdersService — creation with pricing snapshot (ESTIMATED)', () => {
         urgency: 'SCHEDULED',
         supplyMode: 'FULL_PACKAGE',
       }),
+      { cityId: 'city1', branchId: 'b1' },
     );
 
     const createData = (prisma.serviceOrder.create as jest.Mock).mock.calls[0][0].data;
@@ -156,18 +168,25 @@ describe('OrdersService — creation with pricing snapshot (ESTIMATED)', () => {
     expect(createData['locationType']).toBe('APARTMENT');
     expect(createData['lat']).toBe(36.3);
     expect(createData['branchId']).toBe('b1');
-    // BigInt money crossed into JSONB as strings (Invariant 13)
-    expect(createData['pricing']['summary']['totalHardware']).toBe('1500000');
+    expect(prisma.orderPriceRevision.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        status: 'DRAFT',
+        customerViewJson: expect.objectContaining({ netEstimated: amount.toString() }),
+        technicianTermsJson: expect.objectContaining({ agreedPackageNet: servicePackage.technicianPackageNet.toString() }),
+      }),
+    });
+    expect(prisma.orderAddon.createMany).toHaveBeenCalledWith({
+      data: [expect.objectContaining({ revisionId: 'rev1', lineTotal: amount, bucket: 'SERVICE_PACKAGE' })],
+    });
     expect(createData['surgeMultiplier']).toBe(1);
     expect(createData['bundleDiscountPercent']).toBe(0);
 
     const itemData = (prisma.orderItem.create as jest.Mock).mock.calls[0][0].data;
     expect(itemData).toMatchObject({
       serviceDefinitionId: 'def-alarm',
-      supplyMode: 'FULL_PACKAGE',
+      supplyMode: 'INSTALL_ONLY',
       config: { petImmune: true },
     });
-    expect(itemData['pricingSnapshot']['serviceKey']).toBe('ALARM');
 
     const transitions = (prisma.orderStateTransition.createMany as jest.Mock).mock.calls[0][0].data;
     expect(transitions).toEqual([
@@ -230,9 +249,11 @@ describe('OrdersService — role-scoped reads', () => {
   });
 });
 
-describe('OrdersService — happy path through 9 states (escrow composed into transitions)', () => {
-  it('submit: ESTIMATED → SEARCHING_EXPERT with audit row + notification', async () => {
-    const { service, prisma, notificationsService } = buildService(orderFixture('ESTIMATED'));
+describe('OrdersService — order transitions', () => {
+  it('funds the managed revision and records the hold when submitting before dispatch', async () => {
+    const { service, prisma, notificationsService, walletEscrowService } = buildService(orderFixture('ESTIMATED', {
+      pricingVersion: MANAGED_PRICING_VERSION, activeRevision: 1,
+    }));
     await service.submit(customer, 'o1');
     expect(prisma.serviceOrder.updateMany).toHaveBeenCalledWith({
       where: { id: 'o1', state: 'ESTIMATED' },
@@ -246,6 +267,12 @@ describe('OrdersService — happy path through 9 states (escrow composed into tr
         actorUserId: 'c1',
         actorRole: UserRole.CUSTOMER,
       }),
+    });
+    expect(walletEscrowService.holdEscrow).toHaveBeenCalledWith({
+      customerUserId: 'c1', orderId: 'o1', amount, idempotencyKey: 'escrow:hold:o1',
+    }, prisma);
+    expect(prisma.escrowPosition.create).toHaveBeenCalledWith({
+      data: { orderId: 'o1', payerWalletId: 'wallet1', heldAmount: amount, activeRevision: 1 },
     });
     expect(notificationsService.send).toHaveBeenCalledTimes(1);
   });
@@ -261,9 +288,9 @@ describe('OrdersService — happy path through 9 states (escrow composed into tr
     const result = await service.assignTechnician(superAdmin, 'o1', { technicianUserId: 't1' });
 
     expect(result).toMatchObject({ state: 'EXPERT_ASSIGNED', technicianId: 't1' });
-    expect(prisma.serviceOrder.update).toHaveBeenCalledWith({
-      where: { id: 'o1' },
-      data: { technicianId: 't1' },
+    expect(prisma.serviceOrder.updateMany).toHaveBeenCalledWith({
+      where: { id: 'o1', state: 'BRANCH_QUEUE' },
+      data: { technicianId: 't1', state: 'EXPERT_ASSIGNED' },
     });
     expect(notificationsService.send).toHaveBeenCalledTimes(2);
   });
@@ -277,7 +304,7 @@ describe('OrdersService — happy path through 9 states (escrow composed into tr
     });
     await expect(
       service.assignTechnician(superAdmin, 'o1', { technicianUserId: 'tX' }),
-    ).rejects.toThrow(/متعلق به شعبه/);
+    ).rejects.toThrow(/برای این شعبه/);
   });
 
   it('approve-quote holds escrow INSIDE the same transaction as the transition', async () => {
@@ -308,20 +335,23 @@ describe('OrdersService — happy path through 9 states (escrow composed into tr
     await expect(service.approveQuote(customer, 'o1')).rejects.toThrow(BadRequestException);
   });
 
-  it('full happy path: ESTIMATED → … → IN_PROGRESS (each guarded transition + audit)', async () => {
-    const { service } = buildService(orderFixture('ESTIMATED'));
+  it('continues a legacy search through approval of its existing quote to IN_PROGRESS', async () => {
+    const { service } = buildService(orderFixture('SEARCHING_EXPERT', { finalQuoteAmount: 2_000_000n }));
 
-    await service.submit(customer, 'o1');
     await service.branchQueue(branchAdmin, 'o1');
     const assigned = await service.assignTechnician(superAdmin, 'o1', { technicianUserId: 't1' });
     expect(assigned.state).toBe('EXPERT_ASSIGNED');
     await service.enRoute(technician, 'o1');
     await service.startInspection(technician, 'o1');
-    await service.quote(technician, 'o1', { finalQuoteAmount: 2_000_000 });
     await service.approveQuote(customer, 'o1');
     const final = await service.startWork(technician, 'o1');
 
     expect(final.state).toBe('IN_PROGRESS');
+  });
+
+  it('retires manual quoting', () => {
+    const { service } = buildService();
+    expect(() => service.quote()).toThrow(GoneException);
   });
 
   it('non-assigned technician cannot drive the order (404, no leak)', async () => {

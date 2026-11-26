@@ -129,6 +129,17 @@ const cctvUiSchema = {
           pricingVar: 'cameraCount',
         },
         {
+          id: 'ductMeters',
+          type: 'STEPPER',
+          labelFa: 'داکت PVC موردنیاز',
+          unitFa: 'متر',
+          min: 0,
+          max: 100,
+          step: 1,
+          default: 0,
+          pricingVar: 'ductMeters',
+        },
+        {
           id: 'nightPlate',
           type: 'SWITCH',
           labelFa: 'خواندن پلاک خودرو در شب',
@@ -576,6 +587,18 @@ const electricShutterUiSchema = {
 //    NOTE: evaluator must register `ceil` and `max` JSON-Logic operators.
 // ============================================================================
 
+function skuOptions(variable: string, prefix: string, values: string[]) {
+  return {
+    if: [
+      ...values.flatMap((value) => [{ '==': [{ var: variable }, value] }, `${prefix}-${value}`]),
+      `${prefix}-${values[0]}`,
+    ],
+  };
+}
+
+const cctvCableMeters = { '*': [{ var: 'cameraCount' }, 15] };
+const cctvCableCm = { '*': [cctvCableMeters, 100] };
+const cctvDuctCm = { '*': [{ var: 'ductMeters' }, 100] };
 const cctvPricingSchema = {
   $schema: 'homental/pricing-schema/v1',
   currency: 'TOMAN',
@@ -587,11 +610,13 @@ const cctvPricingSchema = {
     cameraQuality: 'STANDARD_4MP',
     storageDays: 15,
     remoteView: true,
+    ductMeters: 0,
   },
   hardware: {
     lineItems: [
       {
         ref: 'CAM',
+        skuLogic: skuOptions('cameraQuality', 'CCTV-CAM', ['STANDARD_4MP', 'ECONOMY_2MP', 'PRO_AI_5MP']),
         labelFa: 'دوربین مداربسته',
         qty: { var: 'cameraCount' },
         unitPriceByOption: {
@@ -635,7 +660,19 @@ const cctvPricingSchema = {
         qty: 1,
         unitPrice: 1200000,
       },
+      {
+        ref: 'CABLE', labelFa: 'کابل دوربین', skuLogic: 'CABLE_RG59_COMBO',
+        qty: cctvCableMeters, quantityCm: cctvCableCm, unitPrice: 15000,
+      },
+      {
+        ref: 'DUCT', labelFa: 'داکت PVC سایز ۲۰', skuLogic: 'DUCT_PVC_20MM',
+        qty: 0, quantityCm: cctvDuctCm,
+      },
     ],
+  },
+  managedWork: {
+    additionalMinutes: { '*': [35, { max: [0, { '-': [{ var: 'cameraCount' }, 4] }] }] },
+    meteredLabor: { titleFa: 'اجرت کابل‌کشی و نصب داکت دوربین', quantityCm: { '+': [cctvCableCm, cctvDuctCm] } },
   },
   labor: {
     base: { labelFa: 'اجرت نصب و راه‌اندازی پایه', amount: 450000 },
@@ -664,6 +701,9 @@ const cctvPricingSchema = {
   multipliersApplyTo: ['labor', 'dispatch'], // surge & urgency NEVER touch hardware
   range: { minAdjustPct: -10, maxAdjustPct: 12 },
 };
+
+const alarmSensorCount = { '+': [{ var: 'doorSensorCount' }, { var: 'windowSensorCount' }, { var: 'motionSensorCount' }] };
+const alarmCableCm = { '*': [alarmSensorCount, 500] };
 
 const alarmPricingSchema = {
   $schema: 'homental/pricing-schema/v1',
@@ -694,6 +734,7 @@ const alarmPricingSchema = {
       },
       {
         ref: 'MOTION_SENSOR',
+        skuLogic: { if: [{ var: 'petImmune' }, 'ALARM-MOTION_SENSOR-PET', 'ALARM-MOTION_SENSOR'] },
         labelFa: 'سنسور تشخیص حرکت',
         qty: { var: 'motionSensorCount' },
         // Pet-immune sensors cost more than standard PIR sensors
@@ -717,7 +758,15 @@ const alarmPricingSchema = {
         qty: { if: [{ var: 'panicButton' }, 1, 0] },
         unitPrice: 950000,
       },
+      {
+        ref: 'CABLE', labelFa: 'کابل دو زوج دزدگیر', skuLogic: 'CABLE_ALARM_2PAIR',
+        qty: 0, quantityCm: alarmCableCm,
+      },
     ],
+  },
+  managedWork: {
+    additionalMinutes: { '*': [12, { max: [0, { '-': [alarmSensorCount, 5] }] }] },
+    meteredLabor: { titleFa: 'اجرت کابل‌کشی دزدگیر', quantityCm: alarmCableCm },
   },
   labor: {
     base: { labelFa: 'اجرت نصب، برنامه‌ریزی ساعتی و تست کامل سیستم', amount: 650000 },
@@ -754,6 +803,7 @@ const parkingJackPricingSchema = {
     lineItems: [
       {
         ref: 'JACK_UNIT',
+        skuLogic: skuOptions('jackType', 'PARKING_JACK-JACK_UNIT', ['SINGLE_ARM', 'DOUBLE_ARM', 'HYDRAULIC']),
         labelFa: 'جک پارکینگی کامل با پایه',
         qty: 1,
         unitPriceByOption: {
@@ -826,6 +876,13 @@ const parkingJackPricingSchema = {
   range: { minAdjustPct: -10, maxAdjustPct: 15 },
 };
 
+const shutterArea = {
+  '*': [
+    { ceil: { '/': [{ var: 'widthCm' }, 100] } },
+    { ceil: { '/': [{ var: 'heightCm' }, 100] } },
+  ],
+};
+
 const electricShutterPricingSchema = {
   $schema: 'homental/pricing-schema/v1',
   currency: 'TOMAN',
@@ -841,6 +898,7 @@ const electricShutterPricingSchema = {
     lineItems: [
       {
         ref: 'MOTOR',
+        skuLogic: { if: [{ '>': [shutterArea, 8] }, 'ELECTRIC_SHUTTER-MOTOR-HEAVY', 'ELECTRIC_SHUTTER-MOTOR'] },
         labelFa: 'موتور برقی و درام',
         qty: 1,
         // motor class depends on area: > 8 m² needs heavy-duty motor
@@ -862,6 +920,7 @@ const electricShutterPricingSchema = {
       },
       {
         ref: 'BLADE',
+        skuLogic: skuOptions('bladeType', 'ELECTRIC_SHUTTER-BLADE', ['ALU_STANDARD', 'ALU_INSULATED', 'POLYCARBONATE', 'STEEL_HEAVY']),
         labelFa: 'پره کرکره (هر متر مربع)',
         qty: {
           '*': [
@@ -1160,6 +1219,17 @@ export const advisoryRules = [
 
 export const platformConfigs = [
   {
+    key: 'pricing.managed',
+    value: {
+      version: 'mashhad-11b-v1',
+      fixedTitleFa: 'تجهیزات با قیمت ثابت',
+      fixedBadgeFa: 'تأمین مستقیم به قیمت همکار — ۰٪ اضافه‌قیمت',
+      packageTitleFa: 'بسته اجرا، لجستیک، پشتیبانی و ضمانت هومنتال',
+      meteredTitleFa: 'اقلام و اجرت متری برآوردشده',
+      delivery: { bikeMaxGrams: 8000, bikeMaxCm3: 24000, bikeToman: '90000', carToman: '220000' },
+    },
+  },
+  {
     key: 'pricing.bundleDiscount',
     value: {
       tiers: [
@@ -1197,6 +1267,9 @@ export const platformConfigs = [
     key: 'dispatch.offer',
     value: {
       ttlSeconds: 30,
+      priorityThresholdBps: 500,
+      topMinRating: 4.7,
+      topMinReviews: 20,
       initialRadiusMeters: 5000,
       radiusStepMeters: 7000,
       maxRadiusMeters: 20000,
@@ -1542,6 +1615,133 @@ async function seedAdvisoryRules(): Promise<void> {
   }
 }
 
+type PilotProduct = [
+  code: string, titleFa: string, partnerPrice: bigint, requiresSerial?: boolean,
+  weightGrams?: number, volumeCm3?: number, unit?: 'EACH' | 'METER',
+];
+
+export const pilotProducts: Record<ServiceKey, PilotProduct[]> = {
+  CCTV: [
+    ['CAM-ECONOMY_2MP', 'دوربین ۲ مگاپیکسل', 2400000n],
+    ['CAM-STANDARD_4MP', 'دوربین ۴ مگاپیکسل', 3650000n],
+    ['CAM-PRO_AI_5MP', 'دوربین ۵ مگاپیکسل هوشمند', 6350000n],
+    ['DVR', 'ضبط‌کننده چهار کانال', 6700000n],
+    ['HDD', 'هارد ذخیره تصاویر', 4350000n],
+    ['PLATE_CAM', 'دوربین پلاک‌خوان شبانه', 8650000n],
+    ['COLOR_NIGHT', 'ماژول دید در شب رنگی', 1470000n, false],
+    ['AUDIO_MODULE', 'ماژول ضبط صدا', 740000n, false],
+    ['CABLE_KIT', 'کانکتور و متعلقات نصب دوربین', 320000n, false],
+    ['CABLE_RG59_COMBO', 'کابل ترکیبی RG59 دوربین', 14_500n, false, 45, 25, 'METER'],
+    ['DUCT_PVC_20MM', 'داکت PVC سایز ۲۰ میلی‌متر', 18_750n, false, 120, 420, 'METER'],
+  ],
+  ALARM: [
+    ['PANEL_KIT', 'پنل مرکزی و منبع تغذیه دزدگیر', 6000000n],
+    ['DOOR_SENSOR', 'سنسور مغناطیسی درب', 740000n, false],
+    ['WINDOW_SENSOR', 'سنسور مغناطیسی پنجره', 690000n, false],
+    ['MOTION_SENSOR', 'سنسور تشخیص حرکت', 1100000n, false],
+    ['MOTION_SENSOR-PET', 'سنسور حرکت سازگار با حیوان خانگی', 1620000n, false],
+    ['SIREN_OUT', 'آژیر بیرونی', 1250000n, false],
+    ['GSM_MODULE', 'ماژول سیم‌کارت دزدگیر', 2800000n],
+    ['PANIC', 'دکمه اعلام خطر', 810000n, false],
+    ['CABLE_ALARM_2PAIR', 'کابل دو زوج دزدگیر', 7_400n, false, 35, 20, 'METER'],
+  ],
+  PARKING_JACK: [
+    ['JACK_UNIT-SINGLE_ARM', 'جک پارکینگی تک‌بازو', 41000000n, true, 13500, 27000],
+    ['JACK_UNIT-DOUBLE_ARM', 'جک پارکینگی دوبازو', 71000000n, true, 23500, 42000],
+    ['JACK_UNIT-HYDRAULIC', 'جک پارکینگی هیدرولیک', 107000000n, true, 26000, 48000],
+    ['INSTALL_FRAME', 'قطعه یک‌متری سازه نصب جک', 2850000n, false, 3800, 8400],
+    ['ELECTRIC_LOCK', 'قفل برقی ضددیلم', 5800000n],
+    ['BATTERY', 'باتری پشتیبان جک پارکینگ', 8600000n, true, 4200],
+    ['SAFETY_EDGE', 'سنسور ایمنی برخورد', 3700000n, false],
+    ['REMOTE', 'ریموت اضافه جک پارکینگ', 790000n, false],
+  ],
+  ELECTRIC_SHUTTER: [
+    ['MOTOR', 'موتور و درام کرکره', 18600000n, true, 9100, 23000],
+    ['MOTOR-HEAVY', 'موتور و درام کرکره سنگین', 28500000n, true, 12500, 34000],
+    ['BLADE-ALU_STANDARD', 'بسته تیغه آلومینیومی استاندارد یک متر مربع', 2280000n, false, 4100, 9000],
+    ['BLADE-ALU_INSULATED', 'بسته تیغه آلومینیومی عایق یک متر مربع', 3190000n, false, 4900, 9000],
+    ['BLADE-POLYCARBONATE', 'بسته تیغه پلی‌کربنات یک متر مربع', 3910000n, false, 4700, 9000],
+    ['BLADE-STEEL_HEAVY', 'بسته تیغه فولادی یک متر مربع', 5190000n, false, 8100, 9000],
+    ['UPS', 'UPS پشتیبان کرکره', 11400000n, true, 4900],
+    ['SMART_MODULE', 'ماژول کنترل هوشمند کرکره', 4400000n],
+    ['REMOTE', 'ریموت اضافه کرکره', 1010000n, false],
+  ],
+};
+
+// RFC allowances exclude freight, which comes from each partner's shipment.
+export const pilotRates = [
+  { serviceKey: ServiceKey.CCTV, standardMinutes: 240, hourlyRate: 700_000n,
+    technicalDifficultyBps: 10_500, meteredLaborPerMeter: 5_500n, normalAllowance: 20_000n, minVisitWage: 850_000n },
+  { serviceKey: ServiceKey.ALARM, standardMinutes: 185, hourlyRate: 1_200_000n,
+    technicalDifficultyBps: 10_000, meteredLaborPerMeter: 4_500n, normalAllowance: 67_500n, minVisitWage: 750_000n },
+  { serviceKey: ServiceKey.PARKING_JACK, standardMinutes: 300, hourlyRate: 870_000n,
+    physicalDifficultyBps: 10_000, normalAllowance: 230_000n, minVisitWage: 1_100_000n },
+  { serviceKey: ServiceKey.ELECTRIC_SHUTTER, standardMinutes: 360, hourlyRate: 1_055_000n,
+    physicalDifficultyBps: 10_000, normalAllowance: 497_500n, minVisitWage: 1_000_000n },
+];
+
+export const pilotSuppliers = {
+  CCTV: { phone: '+989120000030', shopNameFa: 'تأمین تجهیزات امنیتی مشهد' },
+  ALARM: { phone: '+989120000031', shopNameFa: 'تأمین دزدگیر مشهد' },
+  PARKING_JACK: { phone: '+989120000032', shopNameFa: 'تأمین جک پارکینگ مشهد' },
+  ELECTRIC_SHUTTER: { phone: '+989120000033', shopNameFa: 'تأمین کرکره برقی مشهد' },
+} satisfies Record<ServiceKey, { phone: string; shopNameFa: string }>;
+
+export function pilotProductSku(serviceKey: ServiceKey, code: string, unit: 'EACH' | 'METER'): string {
+  return unit === 'METER' ? code : `${serviceKey}-${code}`;
+}
+
+async function seedManagedEconomics(cityId: string, branchId: string): Promise<void> {
+  await prisma.$transaction(async (db) => {
+    for (const serviceKey of Object.values(ServiceKey)) {
+      const { phone, shopNameFa } = pilotSuppliers[serviceKey];
+      const user = await db.user.upsert({
+        where: { phone }, update: {},
+        create: { phone, firstName: 'تأمین تجهیزات', lastName: 'مشهد', role: 'SELLER', status: 'ACTIVE' },
+      });
+      if (user.role !== UserRole.SELLER) throw new Error('The pilot seller phone already belongs to another role.');
+      const seller = await db.sellerProfile.upsert({
+        where: { userId: user.id }, update: {},
+        create: {
+          userId: user.id, cityId, branchId, phone, shopNameFa,
+          addressFa: 'مشهد، بلوار احمدآباد', lat: 36.295, lng: 59.571, status: 'APPROVED', sellerAppFeeFlat: 0n,
+        },
+      });
+      const walletOwner = { ownerType: WalletOwnerType.SELLER, ownerId: user.id };
+      await db.wallet.upsert({ where: { ownerType_ownerId: walletOwner }, update: {}, create: walletOwner });
+
+      for (const [suffix, titleFa, partnerPrice, requiresSerial = true, weightGrams = 500, volumeCm3 = 1000, unit = 'EACH'] of pilotProducts[serviceKey]) {
+        const sku = pilotProductSku(serviceKey, suffix, unit);
+        const product = await db.product.upsert({
+          where: { sku }, update: {},
+          create: { sku, serviceKey, titleFa, unit, requiresSerial, weightGrams, volumeCm3,
+            handlingClass: weightGrams >= 8000 ? 'BULKY' : 'STANDARD' },
+        });
+        const sellerSku = { sellerId: seller.id, sellerSku: sku };
+        await db.sellerOffer.upsert({
+          where: { sellerId_sellerSku: sellerSku }, update: {},
+          create: { ...sellerSku, productId: product.id, partnerPrice, onHandQty: unit === 'METER' ? 10000 : 500 },
+        });
+      }
+    }
+    // Retire the other services' draft pilot offers from the original single supplier.
+    // Keep the rows for orders that already reference them.
+    const oldSkus = Object.values(ServiceKey).filter((key) => key !== ServiceKey.CCTV)
+      .flatMap((key) => pilotProducts[key].map(([suffix, , , , , , unit = 'EACH']) => pilotProductSku(key, suffix, unit)));
+    await db.sellerOffer.updateMany({
+      where: { seller: { phone: pilotSuppliers.CCTV.phone, cityId }, sellerSku: { in: oldSkus } },
+      data: { isActive: false },
+    });
+    for (const rate of pilotRates) {
+      const code = `MSHD-${rate.serviceKey}-V1`;
+      const card = { ...rate, cityId, branchId };
+      await db.installationRateCard.upsert({
+        where: { code }, update: card, create: { ...card, code },
+      });
+    }
+  }, { timeout: 15000 });
+}
+
 async function main() {
   console.log('🌱 Seeding Homental (pilot: Mashhad)...');
 
@@ -1556,13 +1756,15 @@ async function main() {
   await seedPlatformConfigs();
   await seedServiceDefinitions();
   await seedAdvisoryRules();
+  await seedManagedEconomics(cityId, branchId);
 
   console.log('✅ Seed complete:');
   console.log('   • 1 city (Mashhad) + 1 central branch (showroom, 10% commission) + wallets');
-  console.log('   • 6 users (super admin, branch admin, 3 technicians with branch, 1 customer)');
+  console.log('   • 10 users (super admin, branch admin, 3 technicians, 1 customer, 4 sellers)');
   console.log('   • 4 service definitions with full fa uiSchema + pricingSchema');
   console.log('   • 7 advisory rules (JSON-Logic)');
-  console.log('   • 5 platform configs (pricing, escrow, dispatch)');
+  console.log('   • 6 platform configs (pricing, escrow, dispatch)');
+  console.log('   • Partner stock and installation rates for all four Mashhad services');
 }
 
 // Only execute when run directly (`prisma db seed` / ts-node) — importing the

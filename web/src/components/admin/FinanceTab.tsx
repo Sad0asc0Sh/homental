@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { Banknote, Building2, Loader2, Lock, RefreshCw, ShieldCheck, Wallet } from 'lucide-react';
+import { Banknote, Building2, Loader2, Lock, RefreshCw, ShieldCheck, Truck, Wallet } from 'lucide-react';
 import { api, ApiError, type AdminFinanceSummary } from '@/lib/api';
 import { formatToman, toPersianDigits } from '@/lib/format';
 
@@ -70,28 +70,37 @@ export function FinanceTab() {
 
       {/* KPI Cards */}
       <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        <div className="card border-2 border-emerald-200 bg-gradient-to-bl from-emerald-50 to-white sm:col-span-2 lg:col-span-1">
+        <div className="card">
+          <p className="flex items-center gap-1.5 text-xs font-bold text-slate-500">
+            <Wallet size={15} className="text-primary-700" />
+            موجودی قابل برداشت پلتفرم
+          </p>
+          <p className="tabular-fa mt-2 text-lg font-extrabold text-primary-950">
+            {formatToman(summary.platformBalance, 'full')}
+          </p>
+        </div>
+
+        <div className="card border-2 border-emerald-200 bg-gradient-to-bl from-emerald-50 to-white">
           <p className="flex items-center gap-1.5 text-xs font-extrabold text-emerald-800">
             <ShieldCheck size={16} className="text-emerald-600" />
             صندوق ذخیره ریسک ضمانت ۵٪
           </p>
           <p className="tabular-fa mt-2 text-xl font-extrabold text-emerald-950">
-            {formatToman(summary.totalWarrantyReserve, 'full')}
+            {formatToman(summary.restrictedReserve, 'full')}
           </p>
           <p className="mt-1 text-[11px] text-emerald-700">
             دفتر کل اختصاصی پوشش خرابی و گارانتی
           </p>
         </div>
 
-        <div className="card">
-          <p className="flex items-center gap-1.5 text-xs font-bold text-slate-500">
-            <Wallet size={15} className="text-primary-700" />
-            موجودی کل کیف پول پلتفرم
+        <div className="card border-2 border-sky-200 bg-gradient-to-bl from-sky-50 to-white">
+          <p className="flex items-center gap-1.5 text-xs font-extrabold text-sky-800">
+            <Truck size={16} className="text-sky-600" />
+            ذخیره لجستیک و پشتیبانی
           </p>
-          <p className="tabular-fa mt-2 text-lg font-extrabold text-primary-950">
-            {formatToman(summary.platformBalance, 'full')}
+          <p className="tabular-fa mt-2 text-xl font-extrabold text-sky-950">
+            {formatToman(summary.restrictedFulfillment, 'full')}
           </p>
-          <p className="mt-1 text-[11px] text-slate-400">کمیسیون + ذخیره ضمانت تجمیعی</p>
         </div>
 
         <div className="card">
@@ -116,7 +125,7 @@ export function FinanceTab() {
           <p className="mt-1 text-[11px] text-slate-400">در انتظار تکمیل نصب و تأیید تحویل</p>
         </div>
 
-        <div className="card sm:col-span-2 lg:col-span-2">
+        <div className="card">
           <p className="flex items-center gap-1.5 text-xs font-bold text-slate-500">
             <Building2 size={15} className="text-primary-700" />
             کل تسویه با تکنسین‌ها
@@ -125,7 +134,7 @@ export function FinanceTab() {
             {formatToman(summary.totalTechnicianPayout, 'full')}
           </p>
           <p className="mt-1 text-[11px] text-slate-400">
-            خالص پرداختی به کارشناسان پس از کسر کمیسیون و ذخیره ۵٪ ضمانت
+            خالص پرداختی به کارشناسان پس از تحویل سفارش
           </p>
         </div>
       </section>

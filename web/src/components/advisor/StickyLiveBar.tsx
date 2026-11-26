@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { ChevronUp, Loader2, X } from 'lucide-react';
 import { formatToman } from '@/lib/format';
 import { useAdvisorStore } from '@/store/advisor.store';
@@ -143,9 +144,9 @@ export function StickyLiveBar({ ctaHref }: { ctaHref: string }) {
             </div>
           </div>
 
-          <a href={ctaHref} className="btn-primary shrink-0 text-sm">
+          <Link href={ctaHref} className="btn-primary shrink-0 text-sm">
             مشاهده کارنامه امنیتی و ادامه
-          </a>
+          </Link>
         </div>
       </div>
     </>

@@ -61,10 +61,20 @@ export default function ConfigurePage() {
   const toggleService = useAdvisorStore((s) => s.toggleService);
   const evaluate = useAdvisorStore((s) => s.evaluate);
   const isEvaluating = useAdvisorStore((s) => s.isEvaluating);
+  const evaluateError = useAdvisorStore((s) => s.evaluateError);
+  const loadCatalog = useAdvisorStore((s) => s.loadCatalog);
 
-  // Kick off the first live evaluation when arriving at the configurator.
+  // ROOT FIX: this page must load the catalog itself — arriving here directly
+  // (fresh F5, shared link, or expert-mode Path 2) starts with an empty store,
+  // and nothing else fetches it, which left the page on an eternal skeleton.
   useEffect(() => {
-    if (locationType) void evaluate();
+    if (!catalog) {
+      void loadCatalog(locationType, false).then(() => {
+        if (useAdvisorStore.getState().locationType) void evaluate();
+      });
+    } else if (locationType) {
+      void evaluate();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -86,6 +96,25 @@ export default function ConfigurePage() {
       </header>
 
       <div className="mb-6 space-y-4">
+        {evaluateError ? (
+          <div className="rounded-2xl border-2 border-red-200 bg-red-50 p-4 text-sm font-bold leading-6 text-red-600">
+            {evaluateError}
+            <span className="mt-2 block font-normal text-slate-600">
+              در محیط توسعه، بک‌اند باید روی پورت ۳۰۰۰ اجرا شود و مبدأ صفحه
+              (localhost:3001 یا 127.0.0.1:3001) در CORS_ORIGINS مجاز باشد.
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                void evaluate();
+                if (!catalog) void useAdvisorStore.getState().loadCatalog(locationType, false);
+              }}
+              className="btn-primary mt-3"
+            >
+              تلاش مجدد
+            </button>
+          </div>
+        ) : null}
         <BuildingContextBar />
         <PillarsShowcase
           catalog={catalog}

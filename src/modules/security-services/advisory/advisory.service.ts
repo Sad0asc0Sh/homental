@@ -58,7 +58,7 @@ export class AdvisoryService {
     const smartBrief = this.buildSmartBrief(input.locationType, facts, definitions);
 
     let pricing;
-    if (input.includePricing === true) {
+    if (input.includePricing === true || input.sliderBps !== undefined) {
       const activeItems = matched.activeServiceKeys.map((serviceKey) => {
         const factsEntry = facts.services[serviceKey];
         const config: Record<string, unknown> = { ...(factsEntry ?? {}) };
@@ -77,6 +77,7 @@ export class AdvisoryService {
           lng: input.lng,
           urgency: input.urgency as UrgencyLevel | undefined,
           supplyMode: (input.supplyMode as SupplyMode | undefined) ?? undefined,
+          sliderBps: input.sliderBps,
           items: activeItems,
         });
       }

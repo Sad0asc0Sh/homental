@@ -7,9 +7,7 @@ import { buildAdvisoryFacts } from './facts.builder';
 import { computeReadinessScore, SCORING } from './readiness.scorer';
 import { AdvisoryService } from './advisory.service';
 import { JsonLogicEvaluator } from '../shared/json-logic.evaluator';
-import { PricingSchemaInterpreter } from '../pricing/pricing-schema.interpreter';
-import { PricingService } from '../pricing/pricing.service';
-import type { DynamicFactorsService } from '../pricing/dynamic-factors.service';
+import type { PricingEstimateResult, PricingService } from '../pricing/pricing.service';
 
 const seedDefinitions = serviceDefinitions.map((definition) => ({
   ...definition,
@@ -85,22 +83,22 @@ function buildService(ruleOverrides?: unknown[]) {
       update: jest.fn(),
     },
   } as unknown as PrismaService;
-  const factors = {
-    getSurge: jest
-      .fn()
-      .mockResolvedValue({ multiplier: 1, activeTechs: 0, pendingOrders: 0, reasonFa: 'تعرفه عادی' }),
-    getUrgency: jest.fn().mockResolvedValue({ urgency: 'SCHEDULED', multiplier: 1 }),
-    getBundleDiscountPercent: jest.fn(async (count: number) =>
-      count >= 3 ? 10 : count === 2 ? 6 : 0,
-    ),
-  } as unknown as DynamicFactorsService;
-  const pricingService = new PricingService(
-    prisma,
-    new PricingSchemaInterpreter(new JsonLogicEvaluator()),
-    factors,
-  );
-  const service = new AdvisoryService(prisma, new JsonLogicEvaluator(), pricingService);
-  return { service, prisma, pricingService, factors };
+  const estimate: PricingEstimateResult = {
+    currency: 'TOMAN', netEstimated: 10_152_000n, estimatedMin: 10_152_000n, estimatedMax: 10_152_000n,
+    slider: {
+      sliderBps: 0, minDeltaBps: -1500, maxDeltaBps: 2500, packageBaseAmount: 10_152_000n,
+      priorityThresholdBps: 500, dispatchAudience: 'ALL',
+    },
+    invoice: { total: 10_152_000n, buckets: [] },
+    summary: { totalHardware: 0n, bundleDiscountPercent: 6 },
+    factors: {
+      surge: { multiplier: 1, reasonFa: 'تعرفه عادی' },
+      urgency: { urgency: 'SCHEDULED', multiplier: 1 },
+    },
+  };
+  const pricingService = { estimate: jest.fn().mockResolvedValue(estimate) };
+  const service = new AdvisoryService(prisma, new JsonLogicEvaluator(), pricingService as unknown as PricingService);
+  return { service, prisma, pricingService };
 }
 
 const codes = (advisories: Array<{ code: string }>) => advisories.map((a) => a.code);
@@ -418,10 +416,11 @@ describe('AdvisoryService — customer security profiles (customer-scoped)', () 
 
 describe('AdvisoryService — one-call Sticky Live Bar (includePricing, Task 4)', () => {
   it('returns readiness + advisories + smartBrief + pricing in ONE call', async () => {
-    const { service } = buildService();
+    const { service, pricingService } = buildService();
     const result = await service.evaluate({
       locationType: 'SHOP',
       includePricing: true,
+      sliderBps: 500,
       servicesConfig: {
         CCTV: { active: true, cameraCount: 4 },
         ALARM: { active: true },
@@ -435,6 +434,11 @@ describe('AdvisoryService — one-call Sticky Live Bar (includePricing, Task 4)'
     expect(result.pricing!.estimatedMax).toBeGreaterThanOrEqual(result.pricing!.netEstimated);
     // 2 distinct active services → 6% bundle discount in the same response.
     expect(result.pricing?.summary.bundleDiscountPercent).toBe(6);
+    expect(pricingService.estimate).toHaveBeenCalledTimes(1);
+    expect(pricingService.estimate).toHaveBeenCalledWith(expect.objectContaining({
+      sliderBps: 500,
+      items: [expect.objectContaining({ serviceKey: 'CCTV' }), expect.objectContaining({ serviceKey: 'ALARM' })],
+    }));
     expect(result.readiness).toBeDefined();
     expect(result.smartBrief.activeServiceKeys).toEqual(['CCTV', 'ALARM']);
   });

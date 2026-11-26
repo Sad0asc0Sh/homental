@@ -1,10 +1,12 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Loader2, LogIn, MapPin, Radio, RefreshCw, ShieldCheck, Star, X } from 'lucide-react';
 import { AuthModal } from '@/components/brief/AuthModal';
+import { MeteredAdjustmentCard } from '@/components/orders/MeteredAdjustmentCard';
 import { StateBadge, STATE_LABELS } from '@/components/orders/order-state';
+import { ESCROW_AT_SUBMIT, TransparentInvoice } from '@/components/orders/TransparentInvoice';
 import { api, ApiError, type OrderDetail, type WalletMe } from '@/lib/api';
 import { formatToman, generateUuid, toPersianDigits } from '@/lib/format';
 import { parseNotificationPayload, useDispatchSocket } from '@/lib/socket';
@@ -44,6 +46,12 @@ const STEP_LABELS: Record<string, string> = {
   COMPLETED_WARRANTY_ACTIVE: 'گارانتی فعال',
 };
 
+const ESCROW_NOTES = {
+  OPEN: 'مبلغ هنگام ثبت سفارش از کیف پول شما در امانت (اسکرو) قرار گرفت و تا تأیید تحویل نزد هومنتال می‌ماند.',
+  SETTLED: 'مبلغ سفارش هنگام ثبت در امانت قرار گرفت و پس از تأیید تحویل تسویه شد.',
+  REFUNDED: 'مبلغ امانت سفارش به کیف پول شما بازگردانده شد.',
+};
+
 function resolveTimelineIndex(state: string): number {
   if (state === 'BRANCH_QUEUE') return 1;
   return TIMELINE.indexOf(state as (typeof TIMELINE)[number]);
@@ -71,7 +79,7 @@ function Timeline({ order }: { order: OrderDetail }) {
 
   let activeIndex = resolveTimelineIndex(order.state);
   if (isCancelled) {
-    const lastNonCancelled = [...order.stateTransitions]
+    const lastNonCancelled = [...(order.stateTransitions ?? [])]
       .reverse()
       .find((t) => t.toState !== 'CANCELLED')?.toState;
     activeIndex = lastNonCancelled ? resolveTimelineIndex(lastNonCancelled) : -1;
@@ -83,7 +91,8 @@ function Timeline({ order }: { order: OrderDetail }) {
         const done = activeIndex !== -1 && (isCancelled ? activeIndex >= index : activeIndex > index);
         const current = !isCancelled && activeIndex === index;
         const isPurpleQueue = isBranchQueue && index === 1;
-        const label = isPurpleQueue ? 'در صف شعبه (تخصیص دستی)' : STEP_LABELS[step];
+        const label = isPurpleQueue ? 'در صف ارسال دعوت‌نامه شعبه' :
+          step === 'QUOTE_APPROVED' && order.invoice ? 'تأیید تطابق محل' : STEP_LABELS[step];
 
         return (
           <li key={step} className="relative flex items-start gap-3 pb-4 last:pb-0">
@@ -148,8 +157,8 @@ function EscrowApprovalCard({ order, onDone }: { order: OrderDetail; onDone: () 
     refreshWallet();
   }, [refreshWallet]);
 
-  const balance = Number(wallet?.wallet.balance ?? '0');
-  const short = wallet ? Math.max(0, Number(quote) - balance) : 0;
+  const balance = BigInt(wallet?.wallet.balance ?? '0');
+  const short = wallet ? BigInt(quote) - balance : BigInt(0);
 
   const approve = async () => {
     setBusy(true);
@@ -165,11 +174,11 @@ function EscrowApprovalCard({ order, onDone }: { order: OrderDetail; onDone: () 
   };
 
   const quickTopUp = async () => {
-    if (short <= 0) return;
+    if (short <= BigInt(0)) return;
     setBusy(true);
     setError(null);
     try {
-      await api.walletTopup(Number(short) + 1_000_000, generateUuid());
+      await api.walletTopup((short + BigInt(1_000_000)).toString(), generateUuid());
       refreshWallet();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'خطا در شارژ کیف پول.');
@@ -203,9 +212,9 @@ function EscrowApprovalCard({ order, onDone }: { order: OrderDetail; onDone: () 
       {walletError ? (
         <p className="rounded-xl bg-red-50 p-2.5 text-xs font-bold text-red-600">{walletError}</p>
       ) : null}
-      {wallet && short > 0 ? (
+      {wallet && short > BigInt(0) ? (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-amber-50 p-3 text-xs text-amber-800">
-          <span className="font-bold">موجودی کافی نیست — کسری: {formatToman(short, 'full')}</span>
+          <span className="font-bold">موجودی کافی نیست — کسری: {formatToman(short.toString(), 'full')}</span>
           <button type="button" onClick={quickTopUp} disabled={busy} className="btn-ghost !py-1.5 text-xs">
             {busy ? <Loader2 size={13} className="animate-spin" /> : 'شارژ سریع کیف پول'}
           </button>
@@ -218,12 +227,42 @@ function EscrowApprovalCard({ order, onDone }: { order: OrderDetail; onDone: () 
       <button
         type="button"
         onClick={approve}
-        disabled={busy || wallet === null || short > 0}
+        disabled={busy || wallet === null || short > BigInt(0)}
         className="btn-primary w-full"
       >
         {busy ? <Loader2 size={16} className="animate-spin" /> : 'تأیید قیمت و پرداخت امن (Escrow)'}
       </button>
       {error ? <p className="rounded-xl bg-red-50 p-3 text-xs font-bold text-red-600">{error}</p> : null}
+    </section>
+  );
+}
+
+function SubmitOrderCard({ orderId, sliderBps, onDone }: { orderId: string; sliderBps?: number; onDone: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.submitOrder(orderId, sliderBps);
+      onDone();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'خطا در ثبت نهایی سفارش.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="card space-y-3">
+      {error ? <p role="alert" className="rounded-xl bg-red-50 p-3 text-xs font-bold text-red-600">{error}</p> : null}
+      <div className="flex flex-wrap gap-2">
+        <button type="button" disabled={busy} className="btn-primary flex-1" onClick={submit}>
+          {busy ? <Loader2 size={16} className="animate-spin" /> : 'ثبت نهایی و پرداخت امانی'}
+        </button>
+        <Link href="/wallet" className="btn-ghost">کیف پول</Link>
+      </div>
     </section>
   );
 }
@@ -273,7 +312,7 @@ function CancelCard({ order, onDone }: { order: OrderDetail; onDone: () => void 
                 <X size={16} className="text-slate-400" />
               </button>
             </div>
-            {order.state === 'QUOTE_APPROVED' ? (
+            {order.escrowStatus === 'OPEN' || (!order.invoice && order.state === 'QUOTE_APPROVED') ? (
               <p className="rounded-xl bg-emerald-50 p-3 text-xs font-bold text-emerald-700">
                 مبلغ مسدودشده در اسکرو بلافاصله به کیف پول شما بازگردانده می‌شود.
               </p>
@@ -389,19 +428,22 @@ export default function OrderTrackingPage({ params }: { params: { id: string } }
   const [refreshing, setRefreshing] = useState(false);
   const [coords, setCoords] = useState<{ lat: number; lng: number; timestamp: string } | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
+  const requestSequence = useRef(0);
 
   const refetch = useCallback(() => {
     if (!id || !accessToken) return;
+    const sequence = ++requestSequence.current;
     setRefreshing(true);
     setError(null);
     api.order(id)
-      .then(setOrder)
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setRefreshing(false));
+      .then((next) => { if (sequence === requestSequence.current) setOrder(next); })
+      .catch((err: Error) => { if (sequence === requestSequence.current) setError(err.message); })
+      .finally(() => { if (sequence === requestSequence.current) setRefreshing(false); });
   }, [id, accessToken]);
 
   useEffect(() => {
     if (!accessToken) {
+      requestSequence.current++;
       setOrder(null);
       setError(null);
       return;
@@ -425,6 +467,9 @@ export default function OrderTrackingPage({ params }: { params: { id: string } }
     WARRANTY_ACTIVATED: (payload) => {
       if (!payload.orderId || payload.orderId === id) refetch();
     },
+    METERED_ADJUSTMENT_CHANGED: (payload) => {
+      if (payload.orderId === id) refetch();
+    },
     notification: ({ raw }) => {
       const parsed = parseNotificationPayload(raw);
       const targetOrderId = parsed?.data?.orderId;
@@ -437,6 +482,10 @@ export default function OrderTrackingPage({ params }: { params: { id: string } }
   useEffect(() => {
     if (id && accessToken) joinOrder(id);
   }, [id, accessToken, joinOrder]);
+
+  useEffect(() => {
+    if (connected) refetch();
+  }, [connected, refetch]);
 
   if (!hasHydrated) {
     return (
@@ -483,6 +532,10 @@ export default function OrderTrackingPage({ params }: { params: { id: string } }
   }
 
   const isCustomer = user.role === 'CUSTOMER';
+  const stateTransitions = order.stateTransitions ?? [];
+  const cancelReason = stateTransitions.findLast((transition) => transition.toState === 'CANCELLED')?.reason;
+  const escrowNote = order.escrowStatus ? ESCROW_NOTES[order.escrowStatus] :
+    order.state === 'CANCELLED' ? 'پیش‌نویس سفارش پیش از پرداخت لغو شد.' : ESCROW_AT_SUBMIT;
 
   return (
     <main className="mx-auto max-w-2xl space-y-5 px-4 pb-16 pt-6">
@@ -516,23 +569,41 @@ export default function OrderTrackingPage({ params }: { params: { id: string } }
       {order.state === 'CANCELLED' ? (
         <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-center text-sm font-bold text-red-700">
           این سفارش لغو شده است.
-          {order.cancelReason ? (
-            <p className="mt-1 text-xs font-normal text-red-600">دلیل لغو: {order.cancelReason}</p>
+          {cancelReason ? (
+            <p className="mt-1 text-xs font-normal text-red-600">دلیل لغو: {cancelReason}</p>
           ) : null}
         </div>
       ) : null}
 
       {order.state === 'BRANCH_QUEUE' ? (
         <p className="rounded-2xl bg-purple-50 p-4 text-center text-sm font-bold text-purple-700">
-          این سفارش در صف شعبه است؛ به‌زودی به‌صورت دستی کارشناس اختصاص می‌یابد.
+          سفارش در صف شعبه است و پس از پذیرش دعوت‌نامه به کارشناس اختصاص می‌یابد.
         </p>
       ) : null}
 
       <LiveTechnicianBadge coords={coords} />
 
+      {isCustomer && order.state === 'IN_PROGRESS' && order.pendingAdjustment ? (
+        <MeteredAdjustmentCard key={order.pendingAdjustment.id} orderId={order.id} adjustment={order.pendingAdjustment} onDone={refetch} />
+      ) : null}
+
+      {isCustomer && order.latestAdjustment?.status === 'AUTO_REFUNDED' ? (
+        <p role="status" className="rounded-xl bg-emerald-50 p-4 text-sm font-bold text-emerald-800">
+          متراژ مصرفی کمتر از برآورد بود. {formatToman((-BigInt(order.latestAdjustment.deltaAmount)).toString(), 'full')} به کیف پول شما برگشت.
+        </p>
+      ) : null}
+
+      {isCustomer && order.invoice ? (
+        <TransparentInvoice invoice={order.invoice} escrowNote={escrowNote} />
+      ) : null}
+
+      {isCustomer && order.invoice && order.state === 'ESTIMATED' ? (
+        <SubmitOrderCard orderId={order.id} sliderBps={order.slider?.sliderBps} onDone={refetch} />
+      ) : null}
+
       <Timeline order={order} />
 
-      {isCustomer && order.state === 'INSPECTING' && order.finalQuoteAmount ? (
+      {isCustomer && !order.invoice && order.state === 'INSPECTING' && order.finalQuoteAmount ? (
         <EscrowApprovalCard order={order} onDone={refetch} />
       ) : null}
 
@@ -553,10 +624,10 @@ export default function OrderTrackingPage({ params }: { params: { id: string } }
 
       <details className="card">
         <summary className="cursor-pointer text-sm font-bold text-slate-600">
-          تاریخچه وضعیت‌ها ({toPersianDigits(order.stateTransitions.length)} رویداد)
+          تاریخچه وضعیت‌ها ({toPersianDigits(stateTransitions.length)} رویداد)
         </summary>
         <div className="mt-3 space-y-2">
-          {order.stateTransitions.map((transition) => (
+          {stateTransitions.map((transition) => (
             <div key={transition.id} className="flex items-center justify-between text-xs text-slate-500">
               <span>
                 {transition.fromState ? `${STATE_LABELS[transition.fromState]?.labelFa ?? transition.fromState} → ` : ''}

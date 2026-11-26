@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { ArrowLeft, MapPin, ShieldCheck, Zap } from 'lucide-react';
 import { LocationCards, PillarsShowcase } from '@/components/catalog/catalog-parts';
@@ -9,22 +10,27 @@ import { useAuthStore } from '@/store/auth.store';
 import type { LocationType } from '@/lib/types';
 
 export default function HomePage() {
+  const router = useRouter();
   const catalog = useAdvisorStore((s) => s.catalog);
   const isLoadingCatalog = useAdvisorStore((s) => s.isLoadingCatalog);
+  const evaluateError = useAdvisorStore((s) => s.evaluateError);
   const loadCatalog = useAdvisorStore((s) => s.loadCatalog);
   const reset = useAdvisorStore((s) => s.reset);
   const user = useAuthStore((s) => s.user);
 
   // Load the unfiltered 3-pillar canvas for the showcase.
+  // NOTE: no reset() on unmount — client-side navigation must keep the store
+  // (a full wipe here destroyed the preset before /configure could render it).
   useEffect(() => {
     void loadCatalog(null, false);
-    return () => reset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Client-side navigation (router.push) — a full page reload here wiped the
+  // entire Zustand store (preset, locationType) before /configure could read it.
   const selectLocation = (location: LocationType) => {
     void loadCatalog(location, true).then(() => {
-      window.location.href = '/configure';
+      router.push('/configure');
     });
   };
 
@@ -74,7 +80,7 @@ export default function HomePage() {
           onClick={() => {
             reset();
             void loadCatalog(null, false).then(() => {
-              window.location.href = '/configure';
+              router.push('/configure');
             });
           }}
           disabled={isLoadingCatalog}
@@ -95,7 +101,24 @@ export default function HomePage() {
         <p className="mb-4 text-sm text-slate-500">
           ترکیب این سه رکن، کارنامه امنیتی شما را می‌سازد:
         </p>
-        <PillarsShowcase catalog={catalog} />
+        {evaluateError && !catalog ? (
+          <div className="rounded-2xl border-2 border-red-200 bg-red-50 p-4 text-sm font-bold leading-6 text-red-600">
+            {evaluateError}
+            <span className="mt-2 block font-normal text-slate-600">
+              مطمئن شو بک‌اند روی http://localhost:3000 در حال اجراست و صفحه را با
+              http://localhost:3001 باز کن (نه 127.0.0.1) — بعد دکمه تلاش مجدد را بزن.
+            </span>
+            <button
+              type="button"
+              onClick={() => void loadCatalog(null, false)}
+              className="btn-primary mt-3"
+            >
+              تلاش مجدد
+            </button>
+          </div>
+        ) : (
+          <PillarsShowcase catalog={catalog} />
+        )}
       </section>
 
       <footer className="mt-12 rounded-2xl bg-primary-950 p-5 text-white">

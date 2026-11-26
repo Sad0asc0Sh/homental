@@ -1,6 +1,7 @@
 'use client';
 
 import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
 import { api } from '@/lib/api';
 import type {
   Advisory,
@@ -29,6 +30,7 @@ interface AdvisorState {
   selected: Partial<Record<ServiceKey, ServiceSelection>>;
   buildingContext: Record<string, unknown>;
   urgency: UrgencyLevel;
+  sliderBps: number;
   readiness: ReadinessScore | null;
   advisories: Advisory[];
   dismissedAdvisories: string[];
@@ -45,6 +47,7 @@ interface AdvisorState {
   toggleGoal: (key: ServiceKey, goalId: string) => void;
   setBuildingContextValue: (field: string, value: unknown) => void;
   setUrgency: (urgency: UrgencyLevel) => void;
+  setSliderBps: (sliderBps: number) => void;
   applyAdvisory: (advisory: Advisory) => void;
   dismissAdvisory: (code: string) => void;
   setSelectedOrderId: (orderId: string) => void;
@@ -61,10 +64,15 @@ function mergePatch(base: Record<string, unknown>, patch: Record<string, unknown
   return { ...base, ...patch };
 }
 
-export const useAdvisorStore = create<AdvisorState>()((set, get) => {
+export const useAdvisorStore = create<AdvisorState>()(
+  persist(
+    (set, get) => {
   /** Collects the live servicesConfig document + fires the debounced evaluate. */
   const scheduleEvaluate = () => {
     if (evaluateTimer) clearTimeout(evaluateTimer);
+    if (!get().locationType) return;
+    evaluateSeq++;
+    set({ isEvaluating: true, evaluateError: null });
     evaluateTimer = setTimeout(() => {
       void get().evaluate();
     }, EVALUATE_DEBOUNCE_MS);
@@ -90,6 +98,7 @@ export const useAdvisorStore = create<AdvisorState>()((set, get) => {
     selected: {},
     buildingContext: {},
     urgency: 'SCHEDULED',
+    sliderBps: 0,
     readiness: null,
     advisories: [],
     dismissedAdvisories: [],
@@ -117,7 +126,7 @@ export const useAdvisorStore = create<AdvisorState>()((set, get) => {
             };
           }
         }
-        set({ catalog, selected, isLoadingCatalog: false });
+        set({ catalog, selected, sliderBps: applyPreset ? 0 : get().sliderBps, isLoadingCatalog: false });
         scheduleEvaluate();
       } catch (error) {
         set({
@@ -130,6 +139,7 @@ export const useAdvisorStore = create<AdvisorState>()((set, get) => {
     toggleService: (key) => {
       const current = get().selected[key];
       set({
+        sliderBps: 0,
         selected: {
           ...get().selected,
           [key]: {
@@ -189,11 +199,20 @@ export const useAdvisorStore = create<AdvisorState>()((set, get) => {
       scheduleEvaluate();
     },
 
+    setSliderBps: (sliderBps) => {
+      const bounds = get().pricing?.slider;
+      if (!bounds || !Number.isInteger(sliderBps) || sliderBps % 100 !== 0 ||
+          sliderBps < bounds.minDeltaBps || sliderBps > bounds.maxDeltaBps || sliderBps === get().sliderBps) return;
+      set({ sliderBps });
+      scheduleEvaluate();
+    },
+
     applyAdvisory: (advisory) => {
       const action = advisory.suggestedAction;
       if (!action) return;
       const current = get().selected[action.serviceKey];
       set({
+        sliderBps: current?.enabled ? get().sliderBps : 0,
         selected: {
           ...get().selected,
           [action.serviceKey]: {
@@ -216,6 +235,8 @@ export const useAdvisorStore = create<AdvisorState>()((set, get) => {
     },
 
     evaluate: async () => {
+      if (evaluateTimer) clearTimeout(evaluateTimer);
+      evaluateTimer = undefined;
       const state = get();
       if (!state.locationType) return;
       const seq = ++evaluateSeq;
@@ -228,6 +249,7 @@ export const useAdvisorStore = create<AdvisorState>()((set, get) => {
           includePricing: true,
           citySlug: 'mashhad',
           urgency: state.urgency,
+          sliderBps: state.sliderBps,
         });
         if (seq !== evaluateSeq) return; // stale response — drop it
         set({
@@ -247,22 +269,43 @@ export const useAdvisorStore = create<AdvisorState>()((set, get) => {
     },
 
     reset: () => {
+      if (evaluateTimer) clearTimeout(evaluateTimer);
+      evaluateTimer = undefined;
+      evaluateSeq++;
       set({
         locationType: null,
         catalog: null,
         selected: {},
         buildingContext: {},
         urgency: 'SCHEDULED',
+        sliderBps: 0,
         readiness: null,
         advisories: [],
         dismissedAdvisories: [],
         smartBrief: null,
         pricing: null,
+        isEvaluating: false,
+        evaluateError: null,
         selectedOrderId: null,
       });
     },
   };
-});
+    },
+    {
+      // F5 / direct-link recovery: the advisor's user selections survive a
+      // page reload; catalog & readiness are re-fetched by the pages themselves.
+      name: 'homental-advisor',
+      partialize: (state) => ({
+        locationType: state.locationType,
+        selected: state.selected,
+        buildingContext: state.buildingContext,
+        urgency: state.urgency,
+        sliderBps: state.sliderBps,
+        dismissedAdvisories: state.dismissedAdvisories,
+      }),
+    },
+  ),
+);
 
 /** Selector: all currently enabled service keys (bundle-size driver). */
 export function enabledServiceKeys(state: AdvisorState): ServiceKey[] {

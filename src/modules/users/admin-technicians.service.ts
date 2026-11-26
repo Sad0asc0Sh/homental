@@ -68,10 +68,11 @@ export class AdminTechniciansService {
         include: { technicianProfile: true },
       });
       if (existing) {
-        if (existing.role === UserRole.SUPER_ADMIN || existing.role === UserRole.BRANCH_ADMIN) {
+        if (existing.role === UserRole.SUPER_ADMIN || existing.role === UserRole.BRANCH_ADMIN ||
+            existing.role === UserRole.SELLER) {
           throw new ConflictException({
             statusCode: 409,
-            message: 'تبدیل حساب مدیر (ابرادمین یا مدیر شعبه) به تکنسین از این مسیر مجاز نیست.',
+            message: 'تبدیل حساب مدیر یا تأمین‌کننده به تکنسین از این مسیر مجاز نیست.',
           });
         }
         if (
@@ -86,21 +87,10 @@ export class AdminTechniciansService {
         }
       }
 
-      const user = await tx.user.upsert({
-        where: { phone },
-        update: {
-          role: UserRole.TECHNICIAN,
-          firstName: dto.firstName ?? undefined,
-          lastName: dto.lastName ?? undefined,
-        },
-        create: {
-          phone,
-          role: UserRole.TECHNICIAN,
-          status: 'ACTIVE',
-          firstName: dto.firstName,
-          lastName: dto.lastName,
-        },
-      });
+      const identity = { role: UserRole.TECHNICIAN, firstName: dto.firstName, lastName: dto.lastName };
+      const user = existing
+        ? await tx.user.update({ where: { id: existing.id, role: existing.role }, data: identity })
+        : await tx.user.create({ data: { phone, status: 'ACTIVE', ...identity } });
       const profile = await tx.technicianProfile.upsert({
         where: { userId: user.id },
         update: { branchId: dto.branchId, skills: dto.skills },

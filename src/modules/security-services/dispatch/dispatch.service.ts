@@ -1,12 +1,13 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
-import type { ServiceKey } from '@prisma/client';
+import type { DispatchOffer, Prisma, ServiceKey, ServiceOrder } from '@prisma/client';
 import { OrderState } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import { NotificationsService } from '@modules/notifications/notifications.service';
@@ -15,8 +16,13 @@ import { RedisService } from '@infra/redis/redis.service';
 import { RealtimeEvent, RealtimeService } from '@infra/realtime/realtime.service';
 import { scoreCandidate } from './candidate-scorer';
 import type { DispatchWeights } from './candidate-scorer';
+import { assertValidTransition } from '../orders/order-state-machine';
+import { guaranteedPackageNet } from '../orders/order-projections';
+import { MANAGED_PRICING_VERSION } from '../pricing/managed-pricing';
+import { dispatchPriorityPolicy } from './dispatch-priority-policy';
 
-interface DispatchOfferConfig {
+type DispatchAudience = 'TOP' | 'ALL';
+type DispatchOfferConfig = ReturnType<typeof dispatchPriorityPolicy> & {
   ttlSeconds: number;
   initialRadiusMeters: number;
   radiusStepMeters: number;
@@ -24,9 +30,9 @@ interface DispatchOfferConfig {
   maxRounds: number;
   maxParallelOffers: number;
   weights: DispatchWeights;
-}
+};
 
-const DEFAULT_DISPATCH_CONFIG: DispatchOfferConfig = {
+const DEFAULT_DISPATCH_CONFIG = {
   ttlSeconds: 30,
   initialRadiusMeters: 5000,
   radiusStepMeters: 7000,
@@ -37,6 +43,10 @@ const DEFAULT_DISPATCH_CONFIG: DispatchOfferConfig = {
 };
 
 export const OFFER_TTL_MS = 15_000; // per-order Redis lock TTL (Invariant 5)
+const BRANCH_INVITE_TTL_MS = 5 * 60 * 1000;
+const ACTIVE_TECHNICIAN_STATES: OrderState[] = [
+  'EXPERT_ASSIGNED', 'ON_THE_WAY', 'INSPECTING', 'QUOTE_APPROVED', 'IN_PROGRESS', 'HANDOVER_OTP_PENDING',
+];
 
 /**
  * Snapp-like dispatch: expanding-radius waves over the Redis GEO technician
@@ -62,6 +72,7 @@ export class DispatchService {
       ...DEFAULT_DISPATCH_CONFIG,
       ...value,
       weights: { ...DEFAULT_DISPATCH_CONFIG.weights, ...(value.weights ?? {}) },
+      ...dispatchPriorityPolicy(row?.value),
     };
   }
 
@@ -78,316 +89,361 @@ export class DispatchService {
   }
 
   /**
-   * Runs expanding-radius waves. Radius progression starts at
-   * max(initial, lastOfferRadius + step) so decline/expiry escalations never
-   * re-offer the same ring. Zero eligible candidates across all rings →
-   * BRANCH_QUEUE fallback (audit reason NO_TECHNICIAN_IN_RADIUS).
+   * High funded offers open the initial radius to TOP first. ALL then starts
+   * at the initial radius and advances past previously opened ALL rings.
+   * Exhausted rings move the order to the branch queue.
    */
   async startSearch(orderId: string): Promise<{ offersCreated: number; radiusMeters?: number; queued?: boolean }> {
     const order = await this.prisma.serviceOrder.findUnique({
       where: { id: orderId },
-      include: {
-        items: { include: { serviceDefinition: { select: { key: true } } } },
-        address: { include: { city: true } },
-      },
+      include: { items: { include: { serviceDefinition: { select: { key: true } } } }, address: { include: { city: true } } },
     });
     if (!order || order.state !== OrderState.SEARCHING_EXPERT) return { offersCreated: 0 };
     if (order.lat === null || order.lng === null) {
-      await this.queueForBranch(order.id);
-      return { queued: true, offersCreated: 0 };
+      return { queued: await this.queueForBranch(order.id), offersCreated: 0 };
     }
 
-    const config = await this.getDispatchConfig();
+    const [config, revision, history] = await Promise.all([
+      this.getDispatchConfig(),
+      this.offerRevision(this.prisma, order),
+      this.prisma.dispatchOffer.findMany({ where: { orderId, isBranchInvite: false } }),
+    ]);
     const requiredSkills = [...new Set(order.items.map((item) => item.serviceDefinition.key))];
-    const lastRadius = await this.getLastOfferRadius(orderId);
-    // Fresh search → start at the initial ring; decline/expiry escalation → next ring.
-    let radius =
-      lastRadius > 0
-        ? Math.min(config.maxRadiusMeters, lastRadius + config.radiusStepMeters)
-        : config.initialRadiusMeters;
+    if (history.some((offer) => offer.status === 'PENDING')) return { offersCreated: 0 };
+    const topFirst = revision?.status === 'FUNDED' && revision.sliderBps >= config.priorityThresholdBps;
+    const net = guaranteedPackageNet(revision?.technicianTermsJson);
+    const previouslyOffered = new Set(history.map((offer) => offer.technicianId));
+    const tryWave = async (radiusMeters: number, audience: DispatchAudience, firstWave: number) => {
+      const offersCreated = await this.runWave(order, requiredSkills, config, {
+        radiusMeters, previouslyOffered, net, audience, firstWave,
+      });
+      if (offersCreated === null) return { offersCreated: 0 };
+      if (offersCreated === 0) return null;
+      this.realtimeService.emitToOrder(order.id, RealtimeEvent.ORDER_SEARCHING, { orderId, radiusMeters, offersCreated });
+      return { offersCreated, radiusMeters };
+    };
 
-    for (let round = 0; round < config.maxRounds; round += 1) {
-      const offersCreated = await this.runWave(order, requiredSkills, radius, config);
-      if (offersCreated > 0) {
-        this.realtimeService.emitToOrder(order.id, RealtimeEvent.ORDER_SEARCHING, {
-          orderId: order.id,
-          radiusMeters: radius,
-          offersCreated,
-        });
-        return { offersCreated, radiusMeters: radius };
-      }
-      radius += config.radiusStepMeters;
-      if (radius > config.maxRadiusMeters) break;
+    if (topFirst && history.length === 0) {
+      const first = await tryWave(config.initialRadiusMeters, 'TOP', 1);
+      if (first) return first;
     }
-
-    await this.queueForBranch(order.id);
-    return { queued: true, offersCreated: 0 };
+    const lastAllRadius = history.reduce(
+      (max, offer) => offer.audience === 'TOP' ? max : Math.max(max, offer.radiusMeters),
+      0,
+    );
+    for (let round = 0; round < config.maxRounds; round += 1) {
+      const radius = Math.min(config.initialRadiusMeters + round * config.radiusStepMeters, config.maxRadiusMeters);
+      if (radius > lastAllRadius) {
+        const result = await tryWave(radius, 'ALL', topFirst ? 2 : 1);
+        if (result) return result;
+      }
+      if (radius === config.maxRadiusMeters) break;
+    }
+    return { queued: await this.queueForBranch(order.id), offersCreated: 0 };
   }
 
   private async runWave(
-    order: {
-      id: string;
-      orderNumber: string;
-      lat: unknown;
-      lng: unknown;
-      address?: { city?: { slug?: string } } | null;
-    },
-    requiredSkills: string[],
-    radiusMeters: number,
+    order: Pick<ServiceOrder, 'id' | 'orderNumber' | 'lat' | 'lng'> &
+      { address?: { city?: { slug?: string } } | null },
+    requiredSkills: ServiceKey[],
     config: DispatchOfferConfig,
-  ): Promise<number> {
+    wavePlan: {
+      radiusMeters: number; previouslyOffered: ReadonlySet<string>; net: string | null;
+      audience: DispatchAudience; firstWave: number;
+    },
+  ): Promise<number | null> {
+    const { radiusMeters, previouslyOffered, net, audience, firstWave } = wavePlan;
     const nearby = await this.redis.findNearbyTechs(
-      order.address?.city?.slug ?? 'mashhad',
-      Number(order.lat),
-      Number(order.lng),
-      radiusMeters,
-      50,
+      order.address?.city?.slug ?? 'mashhad', Number(order.lat), Number(order.lng), radiusMeters, 50,
     );
-    if (nearby.length === 0) return 0;
-
+    const techIds = nearby.map(({ techId }) => techId).filter((id) => !previouslyOffered.has(id));
+    if (techIds.length === 0) return 0;
     const profiles = await this.prisma.technicianProfile.findMany({
       where: {
-        id: { in: nearby.map((n) => n.techId) },
-        status: 'APPROVED',
-        isOnline: true,
-        isAcceptingOffers: true,
-        skills: { hasSome: requiredSkills as ServiceKey[] },
+        id: { in: techIds }, isOnline: true, ...this.eligibleTechnician(requiredSkills),
+        ...(audience === 'TOP' ? { rating: { gte: config.topMinRating }, ratingCount: { gte: config.topMinReviews } } : {}),
       },
     });
     if (profiles.length === 0) return 0;
-
-    const distanceById = new Map(nearby.map((n) => [n.techId, n.distanceMeters]));
-    const alreadyOffered = await this.prisma.dispatchOffer.findMany({
-      where: { orderId: order.id, technicianId: { in: profiles.map((p) => p.id) } },
-      select: { technicianId: true },
-    });
-    const offeredIds = new Set(alreadyOffered.map((row) => row.technicianId));
-    const candidates = profiles.filter((profile) => !offeredIds.has(profile.id));
-    if (candidates.length === 0) return 0;
-
-    const scored = candidates
-      .map((profile) => ({
-        profile,
-        ...scoreCandidate(
-          {
-            distanceMeters: distanceById.get(profile.id) ?? radiusMeters,
-            skills: profile.skills,
-            rating: Number(profile.rating),
-            ratingCount: profile.ratingCount,
-            warrantyClaimRate: Number(profile.warrantyClaimRate),
-          },
-          requiredSkills,
-          config.weights,
-          radiusMeters,
-        ),
-      }))
-      .sort((a, b) => b.score - a.score)
+    const distanceById = new Map(nearby.map(({ techId, distanceMeters }) => [techId, distanceMeters]));
+    const scored = profiles.map((profile) => ({
+      profile,
+      ...scoreCandidate({
+        distanceMeters: distanceById.get(profile.id) ?? radiusMeters, skills: profile.skills,
+        rating: Number(profile.rating), ratingCount: profile.ratingCount, warrantyClaimRate: Number(profile.warrantyClaimRate),
+      }, requiredSkills, config.weights, radiusMeters),
+    })).sort((a, b) => b.score - a.score || a.profile.id.localeCompare(b.profile.id))
       .slice(0, config.maxParallelOffers);
 
-    const now = Date.now();
-    for (const candidate of scored) {
-      const offer = await this.prisma.dispatchOffer.create({
-        data: {
-          orderId: order.id,
-          technicianId: candidate.profile.id,
-          status: 'PENDING',
-          radiusMeters,
-          distanceMeters: distanceById.get(candidate.profile.id) ?? null,
-          score: candidate.score,
-          scoreBreakdown: candidate.scoreBreakdown,
-          orderLockKey: this.redis.orderLockKey(order.id),
-          expiresAt: new Date(now + config.ttlSeconds * 1000),
-        },
-      });
-      this.realtimeService.emitToUser(candidate.profile.userId, RealtimeEvent.DISPATCH_OFFER, {
-        offerId: offer.id,
-        orderId: order.id,
-        orderNumber: order.orderNumber,
-        score: candidate.score,
-        expiresInMs: config.ttlSeconds * 1000,
-      });
-      await this.notificationsService.send({
-        userId: candidate.profile.userId,
-        type: 'DISPATCH_OFFER',
-        titleFa: 'پیشنهاد سفارش جدید',
-        bodyFa: `پیشنهاد اجرای سفارش ${order.orderNumber} برای شما ارسال شد (${config.ttlSeconds} ثانیه).`,
-        data: { orderId: order.id, offerId: offer.id, score: candidate.score },
-      });
-    }
-    return scored.length;
-  }
-
-  private async getLastOfferRadius(orderId: string): Promise<number> {
-    const rows = await this.prisma.dispatchOffer.findMany({
-      where: { orderId },
-      select: { radiusMeters: true },
-    });
-    return rows.reduce((max, row) => Math.max(max, row.radiusMeters), 0);
-  }
-
-  /** SEARCHING_EXPERT → BRANCH_QUEUE with audit + branch-admin notification. */
-  private async queueForBranch(orderId: string): Promise<void> {
-    const order = await this.prisma.serviceOrder.findUnique({
-      where: { id: orderId },
-      include: { branch: { include: { admin: { select: { id: true } } } } },
-    });
-    if (!order || order.state !== OrderState.SEARCHING_EXPERT) return;
-
-    await this.prisma.$transaction(async (db) => {
-      const updated = await db.serviceOrder.updateMany({
-        where: { id: orderId, state: OrderState.SEARCHING_EXPERT },
-        data: { state: OrderState.BRANCH_QUEUE },
-      });
-      if (updated.count === 0) return;
-      await db.orderStateTransition.create({
-        data: {
-          orderId,
-          fromState: OrderState.SEARCHING_EXPERT,
-          toState: OrderState.BRANCH_QUEUE,
-          actorUserId: null,
-          actorRole: null,
-          reason: 'NO_TECHNICIAN_IN_RADIUS',
-        },
-      });
-    });
-
-    if (order.branch?.admin?.id) {
-      await this.notificationsService.send({
-        userId: order.branch.admin.id,
-        type: 'ORDER_STATUS_CHANGED',
-        titleFa: 'سفارش در صف شعبه',
-        bodyFa: `سفارش ${order.orderNumber} در محدوده جستجو تکنسین نداشت و به صف شعبه ارسال شد.`,
-        data: { orderId, state: 'BRANCH_QUEUE' },
-      });
-    }
-  }
-
-  // ── Offer accept / decline ────────────────────────────────────────────────
-
-  async acceptOffer(actor: AuthenticatedUser, offerId: string) {
-    const offer = await this.prisma.dispatchOffer.findUnique({
-      where: { id: offerId },
-      include: { technician: true, order: true },
-    });
-    if (!offer || offer.technician.userId !== actor.id) {
-      throw new NotFoundException({ statusCode: 404, message: 'پیشنهاد یافت نشد.' });
-    }
-    if (offer.status !== 'PENDING') {
-      throw new ConflictException({
-        statusCode: 409,
-        message: 'این پیشنهاد قبلاً پاسخ داده شده است.',
-      });
-    }
-    if (offer.expiresAt.getTime() <= Date.now()) {
-      await this.prisma.dispatchOffer.update({
-        where: { id: offer.id },
-        data: { status: 'EXPIRED', respondedAt: new Date() },
-      });
-      throw new BadRequestException({ statusCode: 400, message: 'مهلت این پیشنهاد به پایان رسیده است.' });
-    }
-
-    // Invariant 5: ONE atomic per-order lock — parallel accepts can never both win.
-    const lock = await this.redis.acquireOrderLock(offer.orderId, OFFER_TTL_MS);
-    if (!lock.acquired) {
-      throw new ConflictException({
-        statusCode: 409,
-        message: 'این سفارش لحظاتی پیش توسط کارشناس دیگری پذیرفته شد.',
-      });
-    }
-
-    const losers = await this.prisma.dispatchOffer.findMany({
-      where: { orderId: offer.orderId, status: 'PENDING', technicianId: { not: offer.technicianId } },
-      include: { technician: { select: { userId: true } } },
-    });
-
-    try {
-      await this.prisma.$transaction(async (db) => {
-        const updated = await db.serviceOrder.updateMany({
-          where: { id: offer.orderId, state: OrderState.SEARCHING_EXPERT },
-          data: { state: OrderState.EXPERT_ASSIGNED, technicianId: actor.id },
-        });
-        if (updated.count === 0) {
-          throw new ConflictException({
-            statusCode: 409,
-            message: 'این سفارش لحظاتی پیش توسط کارشناس دیگری پذیرفته شد.',
-          });
-        }
-        await db.dispatchOffer.update({
-          where: { id: offer.id },
-          data: { status: 'ACCEPTED', respondedAt: new Date() },
-        });
-        await db.dispatchOffer.updateMany({
-          where: { orderId: offer.orderId, status: 'PENDING', technicianId: { not: offer.technicianId } },
-          data: { status: 'CANCELLED' },
-        });
-        await db.orderStateTransition.create({
+    const result = await this.prisma.$transaction(async (db) => {
+      if (await this.lockOrderState(db, order.id) !== 'SEARCHING_EXPERT') return null;
+      const pending = await db.dispatchOffer.count({ where: { orderId: order.id, status: 'PENDING' } });
+      if (pending > 0) return null;
+      const history = await db.dispatchOffer.findMany({ where: { orderId: order.id, isBranchInvite: false } });
+      // TOP at the initial radius still leaves that radius open to ALL tiers.
+      if (history.some((offer) => audience === 'TOP' || (offer.audience !== 'TOP' && offer.radiusMeters >= radiusMeters))) {
+        return null;
+      }
+      const seen = new Set(history.map((offer) => offer.technicianId));
+      const wave = Math.max(firstWave, await this.nextWave(db, order.id));
+      const expiresAt = new Date(Date.now() + (audience === 'TOP' ? 30 : config.ttlSeconds) * 1000);
+      const offers: { offer: DispatchOffer; userId: string }[] = [];
+      for (const candidate of scored) {
+        if (seen.has(candidate.profile.id)) continue;
+        const offer = await db.dispatchOffer.create({
           data: {
-            orderId: offer.orderId,
-            fromState: OrderState.SEARCHING_EXPERT,
-            toState: OrderState.EXPERT_ASSIGNED,
-            actorUserId: actor.id,
-            actorRole: actor.role,
-            reason: 'پذیرش پیشنهاد توسط تکنسین',
-            metadata: { offerId: offer.id, score: offer.score },
+            orderId: order.id, technicianId: candidate.profile.id, wave, audience,
+            radiusMeters, distanceMeters: distanceById.get(candidate.profile.id) ?? null,
+            score: candidate.score, scoreBreakdown: candidate.scoreBreakdown,
+            orderLockKey: this.redis.orderLockKey(order.id), expiresAt,
           },
         });
+        offers.push({ offer, userId: candidate.profile.userId });
+      }
+      return offers;
+    });
+    if (!result) return null;
+    await Promise.all(result.map(({ offer, userId }) => this.publishOffer(userId, order.orderNumber, offer, net)));
+    return result.length;
+  }
+
+  async inviteTechnician(actor: AuthenticatedUser, orderId: string, technicianUserId: string) {
+    if (actor.role !== 'BRANCH_ADMIN' && actor.role !== 'SUPER_ADMIN') throw new ForbiddenException();
+    const result = await this.prisma.$transaction(async (db) => {
+      await this.lockOrderState(db, orderId);
+      const order = await db.serviceOrder.findUnique({
+        where: { id: orderId },
+        include: { items: { include: { serviceDefinition: { select: { key: true } } } } },
+      });
+      if (!order || (actor.role === 'BRANCH_ADMIN' && (!actor.branchId || order.branchId !== actor.branchId))) {
+        throw new NotFoundException('سفارش یافت نشد.');
+      }
+      if (order.state !== 'BRANCH_QUEUE') throw new ConflictException('فقط برای سفارش‌های صف شعبه می‌توان دعوت‌نامه فرستاد.');
+      const profile = await db.technicianProfile.findUnique({ where: { userId: technicianUserId } });
+      if (!profile || !order.branchId || profile.branchId !== order.branchId) {
+        throw new BadRequestException('تکنسین انتخاب‌شده در این شعبه قابل اعزام نیست.');
+      }
+      const now = new Date();
+      const scope = { orderId, technicianId: profile.id, status: 'PENDING' as const };
+      await db.dispatchOffer.updateMany({
+        where: { ...scope, expiresAt: { lte: now } }, data: { status: 'EXPIRED', respondedAt: now },
+      });
+      const existing = await db.dispatchOffer.findFirst({ where: scope });
+      if (existing?.isBranchInvite) return { offer: existing, alreadySent: true, order, net: null };
+      if (existing) throw new ConflictException('تکنسین برای این سفارش پیشنهاد فعالی دارد.');
+      const skills = order.items.map((item) => item.serviceDefinition.key);
+      const eligible = await db.technicianProfile.findFirst({
+        where: { id: profile.id, branchId: order.branchId, ...this.eligibleTechnician(skills) },
+      });
+      if (!eligible) throw new BadRequestException('تکنسین ظرفیت آزاد یا تمام مهارت‌های لازم برای این سفارش را ندارد.');
+      const wave = await this.nextWave(db, order.id);
+      const net = await this.offerGuarantee(db, order);
+      const offer = await db.dispatchOffer.create({
+        data: {
+          orderId, technicianId: profile.id, wave, audience: 'BRANCH', isBranchInvite: true,
+          radiusMeters: 0, score: 0, scoreBreakdown: {}, orderLockKey: this.redis.orderLockKey(orderId),
+          expiresAt: new Date(now.getTime() + BRANCH_INVITE_TTL_MS),
+        },
+      });
+      return { offer, alreadySent: false, order, net };
+    });
+    if (!result.alreadySent) {
+      await this.publishOffer(technicianUserId, result.order.orderNumber, result.offer, result.net);
+    }
+    return { orderId, offerId: result.offer.id, expiresAt: result.offer.expiresAt };
+  }
+
+  async listMyOffers(actor: AuthenticatedUser) {
+    if (actor.role !== 'TECHNICIAN') throw new ForbiddenException();
+    const offers = await this.prisma.dispatchOffer.findMany({
+      where: { technician: { userId: actor.id }, status: 'PENDING', expiresAt: { gt: new Date() },
+        order: { state: { in: ['SEARCHING_EXPERT', 'BRANCH_QUEUE'] } } },
+      include: { order: true },
+      orderBy: { expiresAt: 'asc' },
+    });
+    return Promise.all(offers.map(async (offer) => this.offerView(
+      offer.order.orderNumber, offer, await this.offerGuarantee(this.prisma, offer.order),
+    )));
+  }
+
+  private async nextWave(db: Prisma.TransactionClient, orderId: string) {
+    const previous = await db.dispatchOffer.findFirst({ where: { orderId, attempt: 1 }, orderBy: { wave: 'desc' } });
+    return (previous?.wave ?? 0) + 1;
+  }
+
+  private async lockOrderState(db: Prisma.TransactionClient, orderId: string) {
+    const [order] = await db.$queryRaw<{ state: OrderState }[]>`
+      SELECT "state" FROM "ServiceOrder" WHERE "id" = ${orderId}::uuid FOR UPDATE
+    `;
+    return order?.state;
+  }
+
+  private eligibleTechnician(skills: ServiceKey[]): Prisma.TechnicianProfileWhereInput {
+    return {
+      status: 'APPROVED', isAcceptingOffers: true, skills: { hasEvery: skills },
+      user: {
+        role: 'TECHNICIAN', status: 'ACTIVE',
+        assignedOrders: { none: { state: { in: ACTIVE_TECHNICIAN_STATES } } },
+      },
+    };
+  }
+
+  private offerRevision(db: Prisma.TransactionClient, order: Pick<ServiceOrder, 'id' | 'activeRevision' | 'pricingVersion'>) {
+    if (order.pricingVersion !== MANAGED_PRICING_VERSION) return null;
+    return db.orderPriceRevision.findUnique({
+      where: { orderId_revision: { orderId: order.id, revision: order.activeRevision } },
+      select: { technicianTermsJson: true, sliderBps: true, status: true },
+    });
+  }
+
+  private async offerGuarantee(db: Prisma.TransactionClient, order: Pick<ServiceOrder, 'id' | 'activeRevision' | 'pricingVersion'>) {
+    const revision = await this.offerRevision(db, order);
+    return guaranteedPackageNet(revision?.technicianTermsJson);
+  }
+
+  private offerView(orderNumber: string, offer: DispatchOffer, net: string | null) {
+    return {
+      offerId: offer.id, orderId: offer.orderId, orderNumber, score: Number(offer.score),
+      expiresAt: offer.expiresAt.toISOString(), expiresInMs: Math.max(0, offer.expiresAt.getTime() - Date.now()),
+      isBranchInvite: offer.isBranchInvite, guaranteedPackageNet: net,
+    };
+  }
+
+  private async publishOffer(userId: string, orderNumber: string, offer: DispatchOffer, net: string | null) {
+    const data = this.offerView(orderNumber, offer, net);
+    this.realtimeService.emitToUser(userId, RealtimeEvent.DISPATCH_OFFER, data);
+    try {
+      await this.notificationsService.send({
+        userId, type: 'DISPATCH_OFFER',
+        titleFa: offer.isBranchInvite ? 'دعوت‌نامه شعبه' : 'پیشنهاد سفارش جدید',
+        bodyFa: `پیشنهاد اجرای سفارش ${orderNumber} برای شما ارسال شد.`,
+        data,
+      });
+    } catch (error) {
+      this.logger.warn(`Dispatch notification failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async queueForBranch(orderId: string): Promise<boolean> {
+    const order = await this.prisma.$transaction(async (db) => {
+      if (await this.lockOrderState(db, orderId) !== 'SEARCHING_EXPERT') return null;
+      if (await db.dispatchOffer.count({ where: { orderId, status: 'PENDING' } })) return null;
+      assertValidTransition('SEARCHING_EXPERT', 'BRANCH_QUEUE');
+      const queuedOrder = await db.serviceOrder.update({
+        where: { id: orderId }, data: { state: 'BRANCH_QUEUE' },
+        include: { branch: { select: { adminId: true } } },
+      });
+      await db.orderStateTransition.create({
+        data: { orderId, fromState: 'SEARCHING_EXPERT', toState: 'BRANCH_QUEUE', reason: 'NO_TECHNICIAN_IN_RADIUS' },
+      });
+      return queuedOrder;
+    });
+    if (order?.branch?.adminId) {
+      await this.notificationsService.send({
+        userId: order.branch.adminId, type: 'ORDER_STATUS_CHANGED',
+        titleFa: 'سفارش در صف شعبه',
+        bodyFa: `سفارش ${order.orderNumber} به صف شعبه ارسال شد.`, data: { orderId, state: 'BRANCH_QUEUE' },
+      });
+    }
+    return order !== null;
+  }
+
+  async acceptOffer(actor: AuthenticatedUser, offerId: string) {
+    if (actor.role !== 'TECHNICIAN') throw new ForbiddenException();
+    const offer = await this.prisma.dispatchOffer.findUnique({
+      where: { id: offerId },
+      include: {
+        technician: true,
+        order: { include: { items: { include: { serviceDefinition: { select: { key: true } } } } } },
+      },
+    });
+    if (!offer || offer.technician.userId !== actor.id) throw new NotFoundException('پیشنهاد یافت نشد.');
+    if (offer.status !== 'PENDING') throw new ConflictException('این پیشنهاد قبلاً پاسخ داده شده است.');
+    if (offer.expiresAt.getTime() <= Date.now()) throw new BadRequestException('مهلت این پیشنهاد به پایان رسیده است.');
+
+    const lock = await this.redis.acquireOrderLock(offer.orderId, OFFER_TTL_MS);
+    if (!lock.acquired || !lock.token) throw new ConflictException('سفارش در حال بررسی توسط کارشناس دیگری است.');
+    const fromState = offer.isBranchInvite ? 'BRANCH_QUEUE' : 'SEARCHING_EXPERT';
+    const toState = 'EXPERT_ASSIGNED';
+    let losers;
+    try {
+      losers = await this.prisma.$transaction(async (db) => {
+        assertValidTransition(fromState, toState);
+        const state = await this.lockOrderState(db, offer.orderId);
+        if (state !== fromState) throw new ConflictException('این سفارش دیگر قابل پذیرش نیست.');
+        await db.$queryRaw`SELECT "id" FROM "TechnicianProfile" WHERE "id" = ${offer.technicianId}::uuid FOR UPDATE`;
+        const skills = offer.order.items.map((item) => item.serviceDefinition.key);
+        const eligible = await db.technicianProfile.findFirst({
+          where: { id: offer.technicianId, userId: actor.id, ...this.eligibleTechnician(skills),
+            ...(offer.isBranchInvite ? { branchId: offer.order.branchId } : {}) },
+        });
+        if (!eligible) throw new ConflictException('ظرفیت یا شرایط پذیرش سفارش تغییر کرده است.');
+
+        const now = new Date();
+        const accepted = await db.dispatchOffer.updateMany({
+          where: { id: offer.id, status: 'PENDING', expiresAt: { gt: now } },
+          data: { status: 'ACCEPTED', respondedAt: now },
+        });
+        if (accepted.count !== 1) throw new ConflictException('این پیشنهاد دیگر قابل پذیرش نیست.');
+        const updated = await db.serviceOrder.updateMany({
+          where: { id: offer.orderId, state: fromState },
+          data: { state: toState, technicianId: actor.id },
+        });
+        if (updated.count !== 1) throw new ConflictException('این سفارش دیگر قابل پذیرش نیست.');
+
+        const pending = { orderId: offer.orderId, status: 'PENDING' as const };
+        const otherOffers = await db.dispatchOffer.findMany({
+          where: pending, include: { technician: { select: { userId: true } } },
+        });
+        await db.dispatchOffer.updateMany({ where: pending, data: { status: 'CANCELLED', respondedAt: now } });
+        await db.orderStateTransition.create({
+          data: {
+            orderId: offer.orderId, fromState, toState, actorUserId: actor.id, actorRole: actor.role,
+            reason: 'پذیرش پیشنهاد توسط تکنسین', metadata: { offerId, isBranchInvite: offer.isBranchInvite },
+          },
+        });
+        return otherOffers;
       });
     } finally {
-      // The lock is ALWAYS released by its own token (Lua compare-and-delete).
-      await this.redis.releaseOrderLock(offer.orderId, lock.token as string);
+      try {
+        await this.redis.releaseOrderLock(offer.orderId, lock.token);
+      } catch (error) {
+        this.logger.warn(`Dispatch lock release failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
 
     for (const loser of losers) {
       this.realtimeService.emitToUser(loser.technician.userId, RealtimeEvent.OFFER_TAKEN, {
-        orderId: offer.orderId,
-        offerId: loser.id,
-        takenByAnotherExpert: true,
+        orderId: offer.orderId, offerId: loser.id, takenByAnotherExpert: true,
       });
     }
     this.realtimeService.emitToOrder(offer.orderId, RealtimeEvent.EXPERT_ASSIGNED, {
-      orderId: offer.orderId,
-      technicianUserId: actor.id,
+      orderId: offer.orderId, technicianUserId: actor.id,
     });
-    await this.notificationsService.send({
-      userId: offer.order.customerId,
-      type: 'ORDER_STATUS_CHANGED',
-      titleFa: 'تکنسین شما انتخاب شد',
-      bodyFa: `برای سفارش ${offer.order.orderNumber} تکنسین اختصاص یافت.`,
-      data: { orderId: offer.orderId, state: 'EXPERT_ASSIGNED' },
-    });
-
-    return { orderId: offer.orderId, state: 'EXPERT_ASSIGNED', offerId: offer.id };
+    try {
+      await this.notificationsService.send({
+        userId: offer.order.customerId, type: 'ORDER_STATUS_CHANGED',
+        titleFa: 'تکنسین شما انتخاب شد', bodyFa: `برای سفارش ${offer.order.orderNumber} تکنسین اختصاص یافت.`,
+        data: { orderId: offer.orderId, state: toState },
+      });
+    } catch (error) {
+      this.logger.warn(`Assignment notification failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { orderId: offer.orderId, state: toState, offerId };
   }
 
   async declineOffer(actor: AuthenticatedUser, offerId: string) {
-    const offer = await this.prisma.dispatchOffer.findUnique({
-      where: { id: offerId },
-      include: { technician: true },
+    if (actor.role !== 'TECHNICIAN') throw new ForbiddenException();
+    const offer = await this.prisma.dispatchOffer.findUnique({ where: { id: offerId }, include: { technician: true } });
+    if (!offer || offer.technician.userId !== actor.id) throw new NotFoundException('پیشنهاد یافت نشد.');
+    const now = new Date();
+    const declined = await this.prisma.dispatchOffer.updateMany({
+      where: { id: offerId, status: 'PENDING', expiresAt: { gt: now } }, data: { status: 'DECLINED', respondedAt: now },
     });
-    if (!offer || offer.technician.userId !== actor.id) {
-      throw new NotFoundException({ statusCode: 404, message: 'پیشنهاد یافت نشد.' });
-    }
-    if (offer.status !== 'PENDING') {
-      throw new ConflictException({ statusCode: 409, message: 'این پیشنهاد قبلاً پاسخ داده شده است.' });
-    }
-    await this.prisma.dispatchOffer.update({
-      where: { id: offer.id },
-      data: { status: 'DECLINED', respondedAt: new Date() },
-    });
-
-    const pending = await this.prisma.dispatchOffer.count({
-      where: { orderId: offer.orderId, status: 'PENDING' },
-    });
-    if (pending === 0) {
-      const order = await this.prisma.serviceOrder.findUnique({ where: { id: offer.orderId } });
-      if (order?.state === OrderState.SEARCHING_EXPERT) {
-        await this.startSearch(offer.orderId);
-      }
-    }
-    return { offerId: offer.id, status: 'DECLINED' };
+    if (declined.count !== 1) throw new ConflictException('این پیشنهاد دیگر قابل پاسخ نیست.');
+    if (!offer.isBranchInvite) await this.onOrderSearching({ orderId: offer.orderId });
+    return { offerId, status: 'DECLINED' };
   }
-
-  // ── Technician status & location sync ─────────────────────────────────────
 
   async getTechnicianMe(actor: AuthenticatedUser) {
     const profile = await this.prisma.technicianProfile.findUnique({

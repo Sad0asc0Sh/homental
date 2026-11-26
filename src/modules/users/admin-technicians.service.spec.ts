@@ -27,21 +27,18 @@ const superAdmin = {
 const activeBranch = { id: 'b1', code: 'MSHD-C1', isActive: true };
 
 interface TxMock {
-  user: { upsert: jest.Mock; findUnique: jest.Mock };
+  user: { create: jest.Mock; update: jest.Mock; findUnique: jest.Mock };
   technicianProfile: { upsert: jest.Mock };
   wallet: { upsert: jest.Mock };
 }
 
 function buildService() {
+  const technician = { id: 'u9', phone: '+989121111111', role: UserRole.TECHNICIAN, status: 'ACTIVE' };
   const tx: TxMock = {
     user: {
       findUnique: jest.fn().mockResolvedValue(null), // new user by default
-      upsert: jest.fn().mockResolvedValue({
-        id: 'u9',
-        phone: '+989121111111',
-        role: UserRole.TECHNICIAN,
-        status: 'ACTIVE',
-      }),
+      create: jest.fn().mockResolvedValue(technician),
+      update: jest.fn(async ({ where }: { where: { id: string } }) => ({ ...technician, id: where.id })),
     },
     technicianProfile: {
       upsert: jest
@@ -84,11 +81,10 @@ describe('AdminTechniciansService — cross-branch isolation (Part B #4)', () =>
       skills: ['CCTV', 'ALARM'],
     });
 
-    expect(tx.user.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        create: expect.objectContaining({ role: UserRole.TECHNICIAN, status: 'ACTIVE' }),
-      }),
-    );
+    expect(tx.user.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ phone: '+989121111111', role: UserRole.TECHNICIAN, status: 'ACTIVE' }),
+    });
+    expect(tx.user.update).not.toHaveBeenCalled();
     expect(tx.technicianProfile.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         create: expect.objectContaining({ branchId: 'b1', status: 'PENDING_APPROVAL' }),
@@ -165,7 +161,8 @@ describe('AdminTechniciansService — cross-branch isolation (Part B #4)', () =>
         skills: ['CCTV'],
       }),
     ).rejects.toThrow(/مدیر/);
-    expect(tx.user.upsert).not.toHaveBeenCalled();
+    expect(tx.user.create).not.toHaveBeenCalled();
+    expect(tx.user.update).not.toHaveBeenCalled();
   });
 
   it('rejects with 409 when the phone belongs to another BRANCH_ADMIN', async () => {
@@ -178,7 +175,19 @@ describe('AdminTechniciansService — cross-branch isolation (Part B #4)', () =>
     await expect(
       service.create(branchAdminA, { phone: '09120000003', branchId: 'b1', skills: ['ALARM'] }),
     ).rejects.toThrow(/مدیر/);
-    expect(tx.user.upsert).not.toHaveBeenCalled();
+    expect(tx.user.create).not.toHaveBeenCalled();
+    expect(tx.user.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects with 409 when the phone belongs to a seller account', async () => {
+    const { service, tx } = buildService();
+    tx.user.findUnique.mockResolvedValue({ id: 'seller1', role: UserRole.SELLER, technicianProfile: null });
+    await expect(
+      service.create(superAdmin, { phone: '09120000003', branchId: 'b1', skills: ['ALARM'] }),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(tx.user.create).not.toHaveBeenCalled();
+    expect(tx.user.update).not.toHaveBeenCalled();
+    expect(tx.technicianProfile.upsert).not.toHaveBeenCalled();
   });
 
   it('BRANCH_ADMIN cannot steal (re-branch) a technician of ANOTHER branch', async () => {
@@ -208,8 +217,14 @@ describe('AdminTechniciansService — cross-branch isolation (Part B #4)', () =>
       branchId: 'b1',
       skills: ['CCTV'],
     });
+    expect(tx.user.update).toHaveBeenCalledWith({
+      where: { id: 'u2', role: UserRole.TECHNICIAN },
+      data: expect.objectContaining({ role: UserRole.TECHNICIAN }),
+    });
+    expect(tx.user.create).not.toHaveBeenCalled();
     expect(tx.technicianProfile.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
+        where: { userId: 'u2' },
         update: expect.objectContaining({ branchId: 'b1' }),
       }),
     );

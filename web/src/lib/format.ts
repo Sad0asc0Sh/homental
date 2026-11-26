@@ -39,6 +39,10 @@ export function formatNumberFa(value: number | string): string {
   return toPersianDigits(numeric.toLocaleString('en-US'));
 }
 
+export function formatMeters(centimetres: number): string {
+  return `${new Intl.NumberFormat('fa-IR', { maximumFractionDigits: 2 }).format(centimetres / 100)} متر`;
+}
+
 /**
  * Money formatting (Toman):
  *  - compact: 14,500,000 → «۱۴.۵ میلیون تومان» (used in the sticky bar)
@@ -48,6 +52,9 @@ export function formatToman(
   value: number | string,
   style: 'compact' | 'full' = 'compact',
 ): string {
+  if (style === 'full' && typeof value === 'string' && /^-?\d+$/.test(value)) {
+    return `${toPersianDigits(BigInt(value).toLocaleString('en-US'))} تومان`;
+  }
   const numeric = typeof value === 'string' ? Number(value) : value;
   if (!Number.isFinite(numeric)) return '—';
   if (style === 'full') return `${formatNumberFa(numeric)} تومان`;

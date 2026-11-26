@@ -10,6 +10,7 @@ import { AdminConfigModule } from '@modules/admin-config/admin-config.module';
 import { CitiesBranchesModule } from '@modules/cities-branches/cities-branches.module';
 import { HealthModule } from '@modules/health/health.module';
 import { NotificationsModule } from '@modules/notifications/notifications.module';
+import { PartnerSupplyModule } from '@modules/partner-supply/partner-supply.module';
 import { SecurityServicesModule } from '@modules/security-services/security-services.module';
 import { UsersModule } from '@modules/users/users.module';
 import { WalletEscrowModule } from '@modules/wallet-escrow/wallet-escrow.module';
@@ -32,6 +33,7 @@ import { WalletEscrowModule } from '@modules/wallet-escrow/wallet-escrow.module'
     WalletEscrowModule,
     AdminConfigModule,
     SecurityServicesModule,
+    PartnerSupplyModule,
   ],
 })
 export class AppModule {}

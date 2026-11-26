@@ -1,12 +1,13 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   HttpException,
   HttpStatus,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { OrderState, type Prisma, type WarrantyClaimStatus } from '@prisma/client';
+import { OrderState, type Prisma, type Warranty, type WarrantyClaim, type WarrantyClaimStatus } from '@prisma/client';
 import { randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import { AppConfigService } from '@config/app-config.service';
@@ -15,10 +16,35 @@ import { WalletEscrowService } from '@modules/wallet-escrow/wallet-escrow.servic
 import { PrismaService } from '@infra/prisma/prisma.service';
 import { RedisService } from '@infra/redis/redis.service';
 import { RealtimeEvent, RealtimeService } from '@infra/realtime/realtime.service';
+import { MANAGED_PRICING_VERSION } from '../pricing/managed-pricing';
+import { activeManagedRevision, managedSerialLineKeys, settleManagedSupply } from '../orders/managed-order-economics';
+import { assertMeteredReconciled } from '../orders/metered-adjustments.service';
+import { assertValidTransition } from '../orders/order-state-machine';
+import type { RegisterHardwareUnitsDto } from './dto/warranty.dto';
 
 const HANDOVER_OTP_TTL_MS = 10 * 60 * 1000;
 const MAX_HANDOVER_ATTEMPTS = 3;
 const HANDOVER_RESEND_LIMIT_PER_MINUTE = 1;
+
+function toWarrantyCard(warranty: Warranty) {
+  const { id, orderId, policyNumber, status, startDate, endDate, coverageMonths, createdAt, updatedAt } = warranty;
+  const coverage = Array.isArray(warranty.coverage) ? warranty.coverage.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const { serviceKey, titleFa, warrantyMonths, serials } = entry;
+    return [{
+      serviceKey: typeof serviceKey === 'string' ? serviceKey : undefined,
+      titleFa: typeof titleFa === 'string' ? titleFa : undefined,
+      warrantyMonths: typeof warrantyMonths === 'number' ? warrantyMonths : undefined,
+      serials: Array.isArray(serials) ? serials.filter((serial) => typeof serial === 'string') : [],
+    }];
+  }) : [];
+  return { id, orderId, policyNumber, status, startDate, endDate, coverageMonths, coverage, createdAt, updatedAt };
+}
+
+function toClaimView(claim: WarrantyClaim) {
+  const { id, warrantyId, status, descriptionFa, resolutionNoteFa, createdAt, updatedAt, resolvedAt } = claim;
+  return { id, warrantyId, status, descriptionFa, resolutionNoteFa, createdAt, updatedAt, resolvedAt };
+}
 
 /**
  * Mandatory Handover Gate (Invariant 9) — ALL THREE locks must pass before
@@ -45,9 +71,44 @@ export class WarrantyService {
   async registerHardwareUnits(
     actor: AuthenticatedUser,
     orderId: string,
-    dto: { units: Array<{ orderItemId: string; categoryFa: string; brand?: string; model?: string; serialNumber: string }> },
+    dto: RegisterHardwareUnitsDto,
   ) {
     const order = await this.requireAssignedOrder(actor, orderId, OrderState.IN_PROGRESS);
+
+    if (order.pricingVersion === MANAGED_PRICING_VERSION) {
+      return this.prisma.$transaction(async (db) => {
+        const [current] = await db.$queryRaw<{ state: OrderState; activeRevision: number }[]>`
+          SELECT "state", "activeRevision" FROM "ServiceOrder" WHERE "id" = ${orderId}::uuid FOR UPDATE
+        `;
+        if (current?.state !== 'IN_PROGRESS' || current.activeRevision !== order.activeRevision) {
+          throw new ConflictException('نسخه یا وضعیت سفارش تغییر کرده است.');
+        }
+        const revision = await activeManagedRevision(db, order);
+        if (!revision || revision.status !== 'FUNDED') throw new ConflictException('نسخه سفارش در دسترس نیست.');
+        const required = managedSerialLineKeys(revision);
+        const lines = new Map(revision.addons.filter((line) => required.has(line.lineKey)).map((line) => [line.id, line]));
+        const existing = await db.hardwareUnit.groupBy({
+          by: ['orderAddonId'], where: { orderAddonId: { in: [...lines.keys()] } }, _count: { _all: true },
+        });
+        const quantities = new Map(existing.map(({ orderAddonId, _count }) => [orderAddonId, _count._all]));
+        const data = dto.units.map((unit) => {
+          const line = unit.orderAddonId ? lines.get(unit.orderAddonId) : undefined;
+          if (!line || line.orderItemId !== unit.orderItemId) {
+            throw new BadRequestException('این قلم به فهرست سریال‌های سفارش تعلق ندارد.');
+          }
+          const registered = (quantities.get(line.id) ?? 0) + 1;
+          if (registered > line.qty) throw new BadRequestException('تعداد سریال‌های این قلم از تعداد توافق‌شده بیشتر است.');
+          quantities.set(line.id, registered);
+          return {
+            orderItemId: unit.orderItemId, orderAddonId: line.id, sku: line.sku, categoryFa: line.titleFa,
+            brand: unit.brand, model: unit.model, serialNumber: unit.serialNumber.trim(), registeredByUserId: actor.id,
+          };
+        });
+        if (data.some((unit) => unit.serialNumber.length < 4)) throw new BadRequestException('شماره سریال معتبر نیست.');
+        await db.hardwareUnit.createMany({ data });
+        return { registered: data.length };
+      });
+    }
 
     const items = await this.prisma.orderItem.findMany({
       where: { orderId: order.id },
@@ -83,56 +144,48 @@ export class WarrantyService {
     orderId: string,
     dto: { defaultPasswordsChanged: boolean; technicianAccessRevoked: boolean },
   ) {
-    const order = await this.requireAssignedOrderWithItems(actor, orderId, OrderState.IN_PROGRESS);
+    const assigned = await this.requireAssignedOrder(actor, orderId, OrderState.IN_PROGRESS);
 
-    // Gate 1: every FULL_PACKAGE item must have at least one registered serial.
-    const unpackagedItems: string[] = [];
-    for (const item of order.items) {
-      const effectiveSupplyMode = item.supplyMode ?? order.supplyMode;
-      if (effectiveSupplyMode === 'FULL_PACKAGE' && item.hardwareUnits.length === 0) {
-        unpackagedItems.push(item.serviceDefinition.titleFa);
-      }
-    }
-    if (unpackagedItems.length > 0) {
-      throw new BadRequestException({
-        statusCode: 400,
-        message: 'قبل از تحویل، ثبت شماره سریال تجهیزات نصب‌شده الزامی است.',
-        metadata: { items: unpackagedItems },
-      });
-    }
-
-    // Gate 2: mandatory privacy checklist.
     if (dto.defaultPasswordsChanged !== true || dto.technicianAccessRevoked !== true) {
-      throw new BadRequestException({
-        statusCode: 400,
-        message: 'تأیید تغییر رمزهای پیش‌فرض و حذف دسترسی فنی نصاب برای تحویل کار الزامی است.',
-      });
+      throw new BadRequestException('تأیید تغییر رمزهای پیش‌فرض و حذف دسترسی نصاب برای تحویل کار الزامی است.');
     }
 
     const otp = String(randomInt(0, 1_000_000)).padStart(6, '0');
     const salt = randomBytes(16).toString('hex');
     const handoverOtpHash = `${salt}:${scryptSync(otp, salt, 32).toString('hex')}`;
 
-    await this.prisma.$transaction(async (db) => {
-      await db.serviceOrder.update({
-        where: { id: order.id },
+    const order = await this.prisma.$transaction(async (db) => {
+      if (assigned.pricingVersion === MANAGED_PRICING_VERSION) {
+        const [current] = await db.$queryRaw<{ state: OrderState }[]>`
+          SELECT "state" FROM "ServiceOrder"
+          WHERE "id" = ${orderId}::uuid AND "technicianId" = ${actor.id}::uuid FOR UPDATE
+        `;
+        if (current?.state !== 'IN_PROGRESS') throw new ConflictException('وضعیت سفارش تغییر کرده است.');
+      }
+      const order = await this.reloadOrder(orderId, db);
+      await assertMeteredReconciled(db, order);
+      const unpackagedItems = await this.missingSerials(order, db);
+      if (unpackagedItems.length > 0) {
+        throw new BadRequestException({
+          statusCode: 400,
+          message: 'قبل از تحویل، ثبت شماره سریال تجهیزات نصب‌شده الزامی است.',
+          metadata: { items: unpackagedItems },
+        });
+      }
+      assertValidTransition(OrderState.IN_PROGRESS, OrderState.HANDOVER_OTP_PENDING);
+      const updated = await db.serviceOrder.updateMany({
+        where: { id: order.id, state: OrderState.IN_PROGRESS, technicianId: actor.id },
         data: {
+          state: OrderState.HANDOVER_OTP_PENDING,
           handoverOtpHash,
           handoverOtpExpiresAt: new Date(Date.now() + HANDOVER_OTP_TTL_MS),
           handoverAttempts: 0,
           privacyChecklistSignedAt: new Date(),
-          privacyChecklistAnswers: {
-            defaultPasswordsChanged: dto.defaultPasswordsChanged,
-            technicianAccessRevoked: dto.technicianAccessRevoked,
-          } as unknown as Prisma.InputJsonValue,
+          privacyChecklistAnswers: { defaultPasswordsChanged: true, technicianAccessRevoked: true },
         },
       });
-      const updated = await db.serviceOrder.updateMany({
-        where: { id: order.id, state: OrderState.IN_PROGRESS },
-        data: { state: OrderState.HANDOVER_OTP_PENDING },
-      });
       if (updated.count === 0) {
-        throw new BadRequestException({ statusCode: 409, message: 'وضعیت سفارش تغییر کرده است؛ دوباره تلاش کنید.' });
+        throw new ConflictException('وضعیت سفارش تغییر کرده است؛ دوباره تلاش کنید.');
       }
       await db.orderStateTransition.create({
         data: {
@@ -145,6 +198,7 @@ export class WarrantyService {
           metadata: { privacyChecklistSigned: true } as unknown as Prisma.InputJsonValue,
         },
       });
+      return order;
     });
 
     await this.notificationsService.send({
@@ -185,13 +239,14 @@ export class WarrantyService {
 
     const otp = String(randomInt(0, 1_000_000)).padStart(6, '0');
     const salt = randomBytes(16).toString('hex');
-    await this.prisma.serviceOrder.update({
-      where: { id: order.id },
+    const renewed = await this.prisma.serviceOrder.updateMany({
+      where: { id: order.id, state: 'HANDOVER_OTP_PENDING', technicianId: actor.id, handoverAttempts: { lt: MAX_HANDOVER_ATTEMPTS } },
       data: {
         handoverOtpHash: `${salt}:${scryptSync(otp, salt, 32).toString('hex')}`,
         handoverOtpExpiresAt: new Date(Date.now() + HANDOVER_OTP_TTL_MS),
       },
     });
+    if (renewed.count === 0) throw new ConflictException('وضعیت سفارش تغییر کرده است.');
 
     await this.notificationsService.send({
       userId: order.customerId,
@@ -210,134 +265,119 @@ export class WarrantyService {
   // ── Step 3: complete handover (atomic gate → warranty + escrow) ──────────
 
   async completeHandover(actor: AuthenticatedUser, orderId: string, dto: { otp: string }) {
-    const order = await this.requireAssignedOrderWithItems(actor, orderId, OrderState.HANDOVER_OTP_PENDING);
-    if (!order.handoverOtpHash || !order.handoverOtpExpiresAt) {
-      throw new BadRequestException({ statusCode: 400, message: 'کد تحویلی برای این سفارش صادر نشده است.' });
+    const assigned = await this.requireAssignedOrder(actor, orderId);
+    if (assigned.state === 'COMPLETED_WARRANTY_ACTIVE') return this.completedHandover(this.prisma, orderId, actor.id);
+    if (assigned.state !== 'HANDOVER_OTP_PENDING') throw new BadRequestException('وضعیت سفارش برای تحویل مناسب نیست.');
+    const order = await this.reloadOrder(orderId);
+    if (!order.handoverOtpHash || !order.handoverOtpExpiresAt || !order.privacyChecklistSignedAt) {
+      throw new BadRequestException('چک‌لیست یا کد تحویل برای این سفارش ثبت نشده است.');
     }
+    const missing = await this.missingSerials(order);
+    if (missing.length > 0) throw new BadRequestException('ثبت شماره سریال اقلام سفارش کامل نیست.');
+    const now = new Date();
+    const guard = {
+      id: order.id, state: OrderState.HANDOVER_OTP_PENDING, technicianId: actor.id,
+      ...(order.pricingVersion === MANAGED_PRICING_VERSION ? { activeRevision: order.activeRevision } : {}),
+      handoverOtpHash: order.handoverOtpHash, handoverAttempts: { lt: MAX_HANDOVER_ATTEMPTS },
+      handoverOtpExpiresAt: { gt: now },
+    };
     if (order.handoverAttempts >= MAX_HANDOVER_ATTEMPTS) {
-      throw new BadRequestException({
-        statusCode: 400,
-        message: 'تعداد تلاش کد تحویل به سقف مجاز رسید؛ با پشتیبانی شعبه تماس بگیرید.',
-      });
+      throw new BadRequestException('تعداد تلاش کد تحویل به سقف مجاز رسید؛ با پشتیبانی شعبه تماس بگیرید.');
     }
-    if (order.handoverOtpExpiresAt.getTime() <= Date.now()) {
-      throw new BadRequestException({ statusCode: 400, message: 'کد تحویل منقضی شده است؛ از تکنسین بخواهید کد جدید صادر کند.' });
+    if (order.handoverOtpExpiresAt <= now) {
+      throw new BadRequestException('کد تحویل منقضی شده است؛ از تکنسین بخواهید کد جدید صادر کند.');
     }
     if (!this.verifyOtp(dto.otp, order.handoverOtpHash)) {
-      const attempts = order.handoverAttempts + 1;
-      await this.prisma.serviceOrder.update({
-        where: { id: order.id },
-        data: { handoverAttempts: attempts },
-      });
-      if (attempts >= MAX_HANDOVER_ATTEMPTS) {
-        throw new BadRequestException({
-          statusCode: 400,
-          message: 'تعداد تلاش کد تحویل به سقف مجاز رسید؛ با پشتیبانی شعبه تماس بگیرید.',
-        });
-      }
-      throw new BadRequestException({ statusCode: 400, message: 'کد تحویل نادرست است.' });
+      await this.prisma.serviceOrder.updateMany({ where: guard, data: { handoverAttempts: { increment: 1 } } });
+      throw new BadRequestException(order.handoverAttempts + 1 >= MAX_HANDOVER_ATTEMPTS
+        ? 'تعداد تلاش کد تحویل به سقف مجاز رسید؛ با پشتیبانی شعبه تماس بگیرید.'
+        : 'کد تحویل نادرست است.');
     }
-    if (!order.finalQuoteAmount) {
-      throw new BadRequestException({ statusCode: 400, message: 'مبلغ نهایی سفارش برای تسویه ثبت نشده است.' });
-    }
+    if (!order.finalQuoteAmount) throw new BadRequestException('مبلغ نهایی سفارش برای تسویه ثبت نشده است.');
+    const amount = order.finalQuoteAmount;
 
-    const now = new Date();
-    const escrowAmount = order.finalQuoteAmount; // narrowed non-null above
-    const freshOrder = await this.reloadOrder(order.id);
-
-    const split = await this.prisma.$transaction(async (db) => {
-      // 1) Optimistic terminal transition + audit.
+    const result = await this.prisma.$transaction(async (db) => {
+      assertValidTransition('HANDOVER_OTP_PENDING', 'COMPLETED_WARRANTY_ACTIVE');
       const updated = await db.serviceOrder.updateMany({
-        where: { id: order.id, state: OrderState.HANDOVER_OTP_PENDING },
-        data: { state: OrderState.COMPLETED_WARRANTY_ACTIVE, completedAt: now },
+        where: guard,
+        data: {
+          state: 'COMPLETED_WARRANTY_ACTIVE', completedAt: now, handoverOtpHash: null, handoverOtpExpiresAt: null,
+        },
       });
       if (updated.count === 0) {
-        throw new BadRequestException({ statusCode: 409, message: 'وضعیت سفارش تغییر کرده است؛ دوباره تلاش کنید.' });
+        const current = await db.serviceOrder.findUnique({ where: { id: orderId } });
+        if (current?.state === 'COMPLETED_WARRANTY_ACTIVE' && current.technicianId === actor.id) {
+          return { replay: await this.completedHandover(db, orderId, actor.id) };
+        }
+        throw new ConflictException('وضعیت سفارش یا کد تحویل تغییر کرده است.');
       }
       await db.orderStateTransition.create({
         data: {
-          orderId: order.id,
-          fromState: OrderState.HANDOVER_OTP_PENDING,
-          toState: OrderState.COMPLETED_WARRANTY_ACTIVE,
-          actorUserId: actor.id,
-          actorRole: actor.role,
-          reason: 'تحویل موفق با تأیید مشتری',
-          metadata: {
-            otpVerified: true,
-            privacyChecklistSigned: true,
-          } as unknown as Prisma.InputJsonValue,
+          orderId, fromState: 'HANDOVER_OTP_PENDING', toState: 'COMPLETED_WARRANTY_ACTIVE',
+          actorUserId: actor.id, actorRole: actor.role, reason: 'تحویل موفق با تأیید مشتری',
+          metadata: { otpVerified: true, privacyChecklistSigned: true },
         },
       });
+      const split = order.pricingVersion === MANAGED_PRICING_VERSION
+        ? await settleManagedSupply(db, this.walletEscrowService, order, actor.id)
+        : await this.walletEscrowService.releaseEscrowAndSplit({
+          orderId, customerUserId: order.customerId, technicianUserId: actor.id,
+          branchId: order.branchId, totalAmount: amount, idempotencyKey: `escrow:release:${orderId}`,
+        }, db);
 
-      // 2) Escrow release + zero-drift split (commission / reserve / payout).
-      const escrowSplit = await this.walletEscrowService.releaseEscrowAndSplit(
-        {
-          orderId: order.id,
-          customerUserId: freshOrder.customerId,
-          technicianUserId: actor.id,
-          branchId: freshOrder.branchId,
-          totalAmount: escrowAmount,
-          idempotencyKey: `escrow:release:${order.id}`,
-        },
-        db,
-      );
-
-      // 3) Digital warranty activation.
-      const coverageMonths = Math.min(
-        ...order.items.map((item) => item.serviceDefinition.warrantyMonths),
-      );
+      const coverageMonths = Math.min(...order.items.map((item) => item.serviceDefinition.warrantyMonths));
       const warranty = await db.warranty.create({
         data: {
-          policyNumber: this.generatePolicyNumber(),
-          orderId: order.id,
-          startDate: now,
-          endDate: this.addMonths(now, coverageMonths),
-          status: 'ACTIVE',
-          coverageMonths,
+          policyNumber: this.generatePolicyNumber(), orderId, startDate: now, endDate: this.addMonths(now, coverageMonths),
+          status: 'ACTIVE', coverageMonths,
           coverage: order.items.map((item) => ({
-            serviceKey: item.serviceDefinition.key,
-            titleFa: item.serviceDefinition.titleFa,
+            serviceKey: item.serviceDefinition.key, titleFa: item.serviceDefinition.titleFa,
             warrantyMonths: item.serviceDefinition.warrantyMonths,
             serials: item.hardwareUnits.map((unit) => unit.serialNumber),
-          })) as unknown as Prisma.InputJsonValue,
-          warrantyReserveAmount: escrowSplit.warrantyReserve,
-          escrowReleasedAt: now,
+          })),
+          warrantyReserveAmount: split.warrantyReserve, escrowReleasedAt: now,
         },
       });
-
-      // 4) Technician stats (feeds dispatch scoring + claim rate).
       await db.technicianProfile.update({
-        where: { userId: actor.id },
-        data: { completedJobs: { increment: 1 } },
+        where: { userId: actor.id }, data: { completedJobs: { increment: 1 } },
       });
-
-      return { escrowSplit, warranty };
+      return { warranty, payout: split.technicianPayout };
     });
 
+    if (result.replay) return result.replay;
     await this.notificationsService.send({
-      userId: freshOrder.customerId,
-      type: 'WARRANTY_ACTIVATED',
-      titleFa: 'گارانتی دیجیتال فعال شد',
-      bodyFa: `سفارش ${freshOrder.orderNumber} تکمیل و گارانتی دیجیتال تا ${split.warranty.coverageMonths} ماه فعال شد.`,
-      data: { orderId: order.id, warrantyId: split.warranty.id },
+      userId: order.customerId, type: 'WARRANTY_ACTIVATED', titleFa: 'گارانتی دیجیتال فعال شد',
+      bodyFa: `سفارش ${order.orderNumber} تکمیل و گارانتی دیجیتال تا ${result.warranty.coverageMonths} ماه فعال شد.`,
+      data: { orderId, warrantyId: result.warranty.id },
     });
-    this.realtimeService.emitToOrder(order.id, RealtimeEvent.WARRANTY_ACTIVATED, {
-      orderId: order.id,
-      warrantyId: split.warranty.id,
-      policyNumber: split.warranty.policyNumber,
+    this.realtimeService.emitToOrder(orderId, RealtimeEvent.WARRANTY_ACTIVATED, {
+      orderId, warrantyId: result.warranty.id, policyNumber: result.warranty.policyNumber,
     });
+    return this.handoverView(orderId, result.warranty, result.payout);
+  }
 
+  private handoverView(orderId: string, warranty: Pick<Warranty, 'policyNumber' | 'coverageMonths'>, payout: bigint) {
     return {
-      orderId: order.id,
-      state: 'COMPLETED_WARRANTY_ACTIVE',
-      warranty: split.warranty,
-      escrowSplit: split.escrowSplit,
+      orderId, state: 'COMPLETED_WARRANTY_ACTIVE' as const, warrantyPolicyNumber: warranty.policyNumber,
+      coverageMonths: warranty.coverageMonths, guaranteedNetPayout: payout,
     };
   }
 
-  // ── Customer warranty card & claims ───────────────────────────────────────
+  private async completedHandover(db: Prisma.TransactionClient, orderId: string, technicianUserId: string) {
+    const [warranty, payout] = await Promise.all([
+      db.warranty.findUnique({ where: { orderId }, select: { policyNumber: true, coverageMonths: true } }),
+      db.walletTransaction.findFirst({
+        where: { orderId, type: 'TECHNICIAN_PAYOUT', status: 'SETTLED',
+          wallet: { ownerType: 'TECHNICIAN', ownerId: technicianUserId } },
+        select: { amount: true },
+      }),
+    ]);
+    if (!warranty || !payout) throw new ConflictException('اطلاعات تحویل و تسویه سفارش کامل نیست.');
+    return this.handoverView(orderId, warranty, payout.amount);
+  }
 
   async myWarranties(actor: AuthenticatedUser) {
+    if (actor.role !== 'CUSTOMER') throw new ForbiddenException();
     const customerProfile = await this.prisma.customerProfile.findUnique({
       where: { userId: actor.id },
     });
@@ -353,7 +393,9 @@ export class WarrantyService {
       },
     });
     return warranties.map((warranty) => ({
-      ...warranty,
+      ...toWarrantyCard(warranty),
+      order: { id: warranty.order.id, orderNumber: warranty.order.orderNumber, completedAt: warranty.order.completedAt },
+      claims: warranty.claims.map(toClaimView),
       daysRemaining: Math.max(
         0,
         Math.ceil((warranty.endDate.getTime() - Date.now()) / 86_400_000),
@@ -386,7 +428,7 @@ export class WarrantyService {
       where: { id: warranty.id },
       data: { status: 'IN_CLAIM' },
     });
-    return { claim, warrantyStatus: 'IN_CLAIM' };
+    return { claim: toClaimView(claim), warrantyStatus: 'IN_CLAIM' };
   }
 
   async updateClaim(
@@ -394,6 +436,7 @@ export class WarrantyService {
     claimId: string,
     dto: { status: WarrantyClaimStatus; resolutionNoteFa?: string },
   ) {
+    if (actor.role !== 'BRANCH_ADMIN' && actor.role !== 'SUPER_ADMIN') throw new ForbiddenException();
     const claim = await this.prisma.warrantyClaim.findUnique({
       where: { id: claimId },
       include: { warranty: { include: { order: true } } },
@@ -427,16 +470,18 @@ export class WarrantyService {
         data: { status: 'ACTIVE' },
       });
     }
-    return { claim: updated, warrantyStatus: remainingOpen === 0 ? 'ACTIVE' : 'IN_CLAIM' };
+    return { claim: toClaimView(updated), warrantyStatus: remainingOpen === 0 ? 'ACTIVE' : 'IN_CLAIM' };
   }
 
   /** Branch-scoped claims queue (BRANCH_ADMIN sees own branch only; SUPER_ADMIN all). */
   async listClaims(actor: AuthenticatedUser) {
+    if (actor.role !== 'BRANCH_ADMIN' && actor.role !== 'SUPER_ADMIN') throw new ForbiddenException();
+    if (actor.role === 'BRANCH_ADMIN' && !actor.branchId) return [];
     const where: Prisma.WarrantyClaimWhereInput =
       actor.role === 'BRANCH_ADMIN'
-        ? { warranty: { order: { branchId: actor.branchId ?? '__none__' } } }
+        ? { warranty: { order: { branchId: actor.branchId } } }
         : {};
-    return this.prisma.warrantyClaim.findMany({
+    const claims = await this.prisma.warrantyClaim.findMany({
       where,
       orderBy: { createdAt: 'desc' },
       include: {
@@ -446,6 +491,11 @@ export class WarrantyService {
           },
         },
       },
+    });
+    if (actor.role === 'SUPER_ADMIN') return claims;
+    return claims.map((claim) => {
+      const { id, orderNumber, branchId, customerId } = claim.warranty.order;
+      return { ...toClaimView(claim), warranty: { ...toWarrantyCard(claim.warranty), order: { id, orderNumber, branchId, customerId } } };
     });
   }
 
@@ -470,7 +520,7 @@ export class WarrantyService {
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
-  private async requireAssignedOrder(actor: AuthenticatedUser, orderId: string, state: OrderState) {
+  private async requireAssignedOrder(actor: AuthenticatedUser, orderId: string, state?: OrderState) {
     if (actor.role !== 'TECHNICIAN') {
       throw new ForbiddenException({ statusCode: 403, message: 'این عملیات مخصوص تکنسین سفارش است.' });
     }
@@ -478,23 +528,14 @@ export class WarrantyService {
     if (!order || order.technicianId !== actor.id) {
       throw new NotFoundException({ statusCode: 404, message: 'سفارش یافت نشد.' });
     }
-    if (order.state !== state) {
+    if (state && order.state !== state) {
       throw new BadRequestException({ statusCode: 400, message: 'وضعیت سفارش برای این عملیات مناسب نیست.' });
     }
     return order;
   }
 
-  private async requireAssignedOrderWithItems(
-    actor: AuthenticatedUser,
-    orderId: string,
-    state: OrderState,
-  ) {
-    const order = await this.requireAssignedOrder(actor, orderId, state);
-    return this.reloadOrder(order.id);
-  }
-
-  private async reloadOrder(orderId: string) {
-    const order = await this.prisma.serviceOrder.findUnique({
+  private async reloadOrder(orderId: string, db: Prisma.TransactionClient = this.prisma) {
+    const order = await db.serviceOrder.findUnique({
       where: { id: orderId },
       include: {
         items: { include: { serviceDefinition: true, hardwareUnits: true } },
@@ -502,6 +543,23 @@ export class WarrantyService {
     });
     if (!order) throw new NotFoundException({ statusCode: 404, message: 'سفارش یافت نشد.' });
     return order;
+  }
+
+  private async missingSerials(order: Awaited<ReturnType<WarrantyService['reloadOrder']>>, db: Prisma.TransactionClient = this.prisma) {
+    if (order.pricingVersion !== MANAGED_PRICING_VERSION) {
+      return order.items.filter((item) =>
+        (item.supplyMode ?? order.supplyMode) === 'FULL_PACKAGE' && item.hardwareUnits.length === 0,
+      ).map((item) => item.serviceDefinition.titleFa);
+    }
+    const revision = await activeManagedRevision(db, order);
+    if (!revision || revision.status !== 'FUNDED') throw new ConflictException('نسخه تأمین مالی شده سفارش یافت نشد.');
+    const keys = managedSerialLineKeys(revision);
+    const registered = new Map<string, number>();
+    for (const { orderAddonId } of order.items.flatMap((item) => item.hardwareUnits)) {
+      if (orderAddonId) registered.set(orderAddonId, (registered.get(orderAddonId) ?? 0) + 1);
+    }
+    return revision.addons.filter((line) => keys.has(line.lineKey) && (registered.get(line.id) ?? 0) < line.qty)
+      .map((line) => line.titleFa);
   }
 
   private verifyOtp(otp: string, stored: string): boolean {

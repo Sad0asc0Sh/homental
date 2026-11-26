@@ -1,5 +1,6 @@
-import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, type OnApplicationShutdown } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import Redis, { Command, type RedisOptions } from 'ioredis';
 // Value import REQUIRED for NestJS DI metadata (see Part A hotfix #1).
 import { AppConfigService } from '@config/app-config.service';
@@ -144,7 +145,7 @@ export class PubSubDispatcher {
  * Invariant 5: `SET dispatch:order:lock:{orderId} token NX PX ttlMs`.
  */
 @Injectable()
-export class RedisService implements OnModuleDestroy {
+export class RedisService implements OnApplicationShutdown {
   private readonly logger = new Logger(RedisService.name);
   readonly command: Redis;
   readonly subscriber: Redis;
@@ -269,6 +270,7 @@ export class RedisService implements OnModuleDestroy {
   }
 
   async subscribe<T>(channel: string, handler: (payload: T) => void | Promise<void>): Promise<void> {
+    await this.waitForSubscriber();
     const wrapped = (message: string): void => {
       let payload: T;
       try {
@@ -303,6 +305,7 @@ export class RedisService implements OnModuleDestroy {
     pattern: string,
     handler: (channel: string, message: string) => void | Promise<void>,
   ): Promise<void> {
+    await this.waitForSubscriber();
     const wrapped = (channel: string, message: string): void => {
       void Promise.resolve(handler(channel, message)).catch((error: unknown) =>
         this.logger.error(
@@ -323,6 +326,13 @@ export class RedisService implements OnModuleDestroy {
     }
   }
 
+  private async waitForSubscriber(): Promise<void> {
+    // Send SUBSCRIBE only after ioredis completes its ready check in normal mode.
+    if (this.subscriber.status !== 'ready') {
+      await once(this.subscriber, 'ready', { signal: AbortSignal.timeout(5000) });
+    }
+  }
+
   // ── Health & lifecycle ────────────────────────────────────────────────────
 
   async ping(): Promise<RedisPingResult> {
@@ -334,7 +344,8 @@ export class RedisService implements OnModuleDestroy {
     return { latencyMs: Date.now() - startedAt };
   }
 
-  async onModuleDestroy(): Promise<void> {
+  async onApplicationShutdown(): Promise<void> {
+    // Closing the subscriber also removes all of its channel subscriptions.
     const close = async (client: Redis): Promise<void> => {
       try {
         await client.quit();

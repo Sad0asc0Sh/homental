@@ -35,9 +35,9 @@ describe('PricingSchemaInterpreter — CCTV', () => {
   });
 
   it('computes 4 cameras × quality price, DVR channels, 2 HDDs (30 days) and the plate camera', () => {
-    expect(result.hardwareSubtotal).toBe(44_500_000n); // 16.4M + 7.5M + 9.6M + 9.8M + 1.2M
+    expect(result.hardwareSubtotal).toBe(45_400_000n); // includes 60 m of cable at 15,000 Toman/m
     const refs = result.hardwareLines.map((line) => line.ref);
-    expect(refs).toEqual(['CAM', 'DVR', 'HDD', 'PLATE_CAM', 'CABLE_KIT']);
+    expect(refs).toEqual(['CAM', 'DVR', 'HDD', 'PLATE_CAM', 'CABLE_KIT', 'CABLE']);
     const hdd = result.hardwareLines.find((line) => line.ref === 'HDD');
     expect(hdd?.qty).toBe(2); // storageDays >= 30 → two drives
     // Zero-quantity lines (COLOR_NIGHT / AUDIO_MODULE off) are excluded.

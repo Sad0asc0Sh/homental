@@ -11,10 +11,10 @@ import {
   type AdminBranch,
   type AdminTechniciansPage,
   type AdminWarrantyClaim,
-  type OrderRow,
+  type BranchOrderRow,
   type OrdersPage,
 } from '@/lib/api';
-import { formatToman, toLatinDigits, toPersianDigits } from '@/lib/format';
+import { toLatinDigits, toPersianDigits } from '@/lib/format';
 import { useDispatchSocket } from '@/lib/socket';
 import { useAuthStore } from '@/store/auth.store';
 
@@ -57,9 +57,10 @@ function useAdminTechnicians(status?: string) {
   return { techs, loading, error, reload };
 }
 
-function Tab1Queue({ orders, reload }: { orders: OrderRow[]; reload: () => void }) {
+function Tab1Queue({ orders, reload }: { orders: BranchOrderRow[]; reload: () => void }) {
   const [filter, setFilter] = useState<'ALL' | 'BRANCH_QUEUE' | 'ACTIVE'>('ALL');
   const [selectedTechByOrder, setSelectedTechByOrder] = useState<Record<string, string>>({});
+  const [invitations, setInvitations] = useState<Record<string, { technicianUserId: string; expiresAt: string }>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const { techs } = useAdminTechnicians('APPROVED');
@@ -79,15 +80,16 @@ function Tab1Queue({ orders, reload }: { orders: OrderRow[]; reload: () => void 
     return true;
   });
 
-  const assign = async (orderId: string, technicianUserId: string) => {
+  const invite = async (orderId: string, technicianUserId: string) => {
     if (!technicianUserId) return;
     setBusyId(orderId);
     setError(null);
     try {
-      await api.assignTechnician(orderId, technicianUserId);
+      const { expiresAt } = await api.inviteTechnician(orderId, technicianUserId);
+      setInvitations((prev) => ({ ...prev, [orderId]: { technicianUserId, expiresAt } }));
       reload();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'خطا در تخصیص تکنسین.');
+      setError(err instanceof ApiError ? err.message : 'خطا در ارسال دعوت‌نامه.');
     } finally {
       setBusyId(null);
     }
@@ -121,7 +123,11 @@ function Tab1Queue({ orders, reload }: { orders: OrderRow[]; reload: () => void 
       ) : null}
 
       {filtered.map((order) => {
-        const chosenUserId = selectedTechByOrder[order.id] ?? approvedTechs[0]?.userId ?? '';
+        const eligibleTechs = approvedTechs.filter((tech) => tech.branchId === order.branchId &&
+          order.items.every((item) => tech.skills.includes(item.serviceDefinition.key)));
+        const selection = selectedTechByOrder[order.id];
+        const chosenUserId = eligibleTechs.find((tech) => tech.userId === selection)?.userId ?? eligibleTechs[0]?.userId ?? '';
+        const invitation = invitations[order.id];
         const serviceTitles = (order.items ?? [])
           .map((item) => item.serviceDefinition?.titleFa)
           .filter(Boolean)
@@ -145,21 +151,11 @@ function Tab1Queue({ orders, reload }: { orders: OrderRow[]; reload: () => void 
               </div>
             </header>
 
-            {order.finalQuoteAmount ? (
-              <p className="tabular-fa text-xs text-slate-500">
-                پیش‌فاکتور: {formatToman(order.finalQuoteAmount, 'full')}
-              </p>
-            ) : order.pricing?.netEstimated ? (
-              <p className="tabular-fa text-xs text-slate-500">
-                برآورد اولیه: {formatToman(order.pricing.netEstimated, 'full')}
-              </p>
-            ) : null}
-
             {order.state === 'BRANCH_QUEUE' ? (
               <div className="space-y-2 rounded-xl bg-purple-50/60 p-3">
-                <p className="text-xs font-bold text-purple-900">تخصیص دستی تکنسین تأیید‌شده:</p>
-                {approvedTechs.length === 0 ? (
-                  <p className="text-xs text-slate-500">تکنسین تأیید‌شده‌ای در شعبه نیست.</p>
+                <p className="text-xs font-bold text-purple-900">تکنسین پس از پذیرش دعوت‌نامه به سفارش اختصاص می‌یابد.</p>
+                {eligibleTechs.length === 0 ? (
+                  <p className="text-xs text-slate-500">تکنسین تأیید‌شده با مهارت‌های لازم در این شعبه پیدا نشد.</p>
                 ) : (
                   <div className="flex flex-col gap-2 sm:flex-row">
                     <select
@@ -172,7 +168,7 @@ function Tab1Queue({ orders, reload }: { orders: OrderRow[]; reload: () => void 
                       }
                       className="flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-xs font-bold text-slate-700 focus:border-primary-400 focus:outline-none"
                     >
-                      {approvedTechs.map((tech) => {
+                      {eligibleTechs.map((tech) => {
                         const skillLabels = tech.skills
                           .map((s) => SERVICE_LABELS[s] ?? s)
                           .join('، ');
@@ -190,17 +186,22 @@ function Tab1Queue({ orders, reload }: { orders: OrderRow[]; reload: () => void 
                     <button
                       type="button"
                       disabled={busyId === order.id || !chosenUserId}
-                      onClick={() => void assign(order.id, chosenUserId)}
+                      onClick={() => void invite(order.id, chosenUserId)}
                       className="btn-primary !py-2.5 text-xs"
                     >
                       {busyId === order.id ? (
                         <Loader2 size={14} className="animate-spin" />
                       ) : (
-                        'تخصیص دستی تکنسین'
+                        'ارسال دعوت‌نامه ۵ دقیقه‌ای'
                       )}
                     </button>
                   </div>
                 )}
+                {invitation?.technicianUserId === chosenUserId ? (
+                  <p role="status" className="text-xs font-bold text-purple-700">
+                    دعوت‌نامه ارسال شد. مهلت پذیرش تا {new Date(invitation.expiresAt).toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' })}
+                  </p>
+                ) : null}
               </div>
             ) : null}
           </section>
@@ -605,14 +606,14 @@ function Tab3Claims() {
 
 function BranchDashboard({ userRole }: { userRole: string }) {
   const accessToken = useAuthStore((s) => s.accessToken);
-  const [orders, setOrders] = useState<OrdersPage | null>(null);
+  const [orders, setOrders] = useState<OrdersPage<BranchOrderRow> | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [tab, setTab] = useState<TabKey>('queue');
 
   const reloadOrders = useCallback(() => {
     if (!accessToken) return;
     setRefreshing(true);
-    api.orders({ limit: 50 })
+    api.orders<BranchOrderRow>({ limit: 50 })
       .then(setOrders)
       .catch(() => undefined)
       .finally(() => setRefreshing(false));

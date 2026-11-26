@@ -6,6 +6,7 @@ import {
   IsObject,
   IsOptional,
   IsString,
+  IsUUID,
   Length,
   Max,
   Min,
@@ -18,6 +19,10 @@ export class RegisterHardwareUnitDto {
   @IsString()
   @Length(1, 80)
   orderItemId!: string;
+
+  @IsOptional()
+  @IsUUID()
+  orderAddonId?: string;
 
   @IsString()
   @Length(1, 80)

@@ -15,10 +15,11 @@ import {
 } from 'class-validator';
 import { LocationType, SecurityPillar, ServiceKey, SupplyMode, UrgencyLevel } from '@prisma/client';
 import type { ServiceConfigAnswer } from '../advisory.types';
+import { SliderSelectionDto } from '../../pricing/dto/slider-selection.dto';
 
 // ── Guest / customer evaluation ──────────────────────────────────────────────
 
-export class EvaluateAdvisoryDto {
+export class EvaluateAdvisoryDto extends SliderSelectionDto {
   @IsIn(Object.values(LocationType))
   locationType!: LocationType;
 

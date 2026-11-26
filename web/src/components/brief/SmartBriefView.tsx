@@ -1,15 +1,34 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { BadgeCheck, Loader2, MapPin, ShieldCheck } from 'lucide-react';
+import Link from 'next/link';
+import { BadgeCheck, Loader2, MapPin } from 'lucide-react';
 import { readinessColor } from '@/components/advisor/StickyLiveBar';
+import { ESCROW_AT_SUBMIT, TransparentInvoice } from '@/components/orders/TransparentInvoice';
 import { AuthModal } from './AuthModal';
 import { api, ApiError } from '@/lib/api';
-import { formatNumberFa, formatToman } from '@/lib/format';
+import { formatNumberFa, formatToman, toPersianDigits } from '@/lib/format';
 import { useAdvisorStore } from '@/store/advisor.store';
 import { useAuthStore } from '@/store/auth.store';
-import type { CityDto, UrgencyLevel } from '@/lib/types';
+import type { CityDto, ManagedInvoice, UrgencyLevel } from '@/lib/types';
+
+function matchesDisplayedInvoice(displayed: ManagedInvoice, frozen: ManagedInvoice) {
+  if (displayed.total !== frozen.total || displayed.buckets.length !== frozen.buckets.length) return false;
+  return displayed.buckets.every((bucket, index) => {
+    const revised = frozen.buckets[index];
+    if (
+      !revised || revised.bucket !== bucket.bucket || revised.subtotal !== bucket.subtotal ||
+      revised.lines.length !== bucket.lines.length
+    ) return false;
+    return bucket.lines.every((line, lineIndex) => {
+      const updated = revised.lines[lineIndex];
+      return updated?.lineKey === line.lineKey && updated.sku === line.sku && updated.titleFa === line.titleFa &&
+        updated.qty === line.qty && updated.quantityCm === line.quantityCm && updated.unit === line.unit &&
+        updated.unitPrice === line.unitPrice && updated.lineTotal === line.lineTotal;
+    });
+  });
+}
 
 const URGENCY_OPTIONS: Array<{ value: UrgencyLevel; labelFa: string }> = [
   { value: 'SCHEDULED', labelFa: 'زمان‌بندی عادی' },
@@ -94,7 +113,7 @@ function UrgencySelector() {
         })}
       </div>
       <p className="text-[11px] leading-5 text-slate-400">
-        ضریب فوریت فقط روی اجرت نصب و هزینه اعزام اعمال می‌شود؛ قیمت سخت‌افزار همیشه ثابت می‌ماند.
+        ضریب فوریت روی هزینه اجرای بسته اعمال می‌شود و تجهیزات با قیمت همکار محاسبه می‌شوند.
       </p>
     </div>
   );
@@ -102,92 +121,74 @@ function UrgencySelector() {
 
 function PricingBreakdown() {
   const pricing = useAdvisorStore((s) => s.pricing);
-  if (!pricing) return null;
+  return pricing ? <TransparentInvoice invoice={pricing.invoice} escrowNote={ESCROW_AT_SUBMIT} /> : null;
+}
+
+function formatSliderPercent(bps: number): string {
+  return `${bps > 0 ? '+' : bps < 0 ? '−' : ''}${toPersianDigits(Math.abs(bps / 100))}٪`;
+}
+
+function BargainingControl() {
+  const inputId = useId();
+  const price = useAdvisorStore((s) => s.pricing);
+  const sliderBps = useAdvisorStore((s) => s.sliderBps);
+  const setSliderBps = useAdvisorStore((s) => s.setSliderBps);
+  const isEvaluating = useAdvisorStore((s) => s.isEvaluating);
+  const error = useAdvisorStore((s) => s.evaluateError);
+  const evaluate = useAdvisorStore((s) => s.evaluate);
+  const slider = price?.slider;
+  if (!slider) return null;
+
+  const { minDeltaBps, maxDeltaBps, priorityThresholdBps, packageBaseAmount } = slider;
+  const standard = BigInt(packageBaseAmount);
+  const selected = standard * BigInt(10_000 + sliderBps) / BigInt(10_000);
+  const priority = sliderBps >= priorityThresholdBps;
+
   return (
-    <section className="card space-y-3">
-      <h2 className="text-base font-extrabold text-slate-800">پیش‌فاکتور شفاف هومنتال</h2>
-      {pricing.items.map((item) => (
-        <div key={item.serviceKey} className="rounded-xl bg-slate-50 p-4">
-          <div className="mb-2 flex items-center justify-between">
-            <p className="text-sm font-extrabold text-slate-700">{item.titleFa}</p>
-            <span className="chip bg-white text-[11px] text-slate-500">
-              {item.supplyMode === 'INSTALL_ONLY' ? 'فقط نصب' : 'کالا + نصب'}
-            </span>
-          </div>
-          {!item.hardwareDropped ? (
-            <div className="space-y-1">
-              {item.hardwareLines.map((line) => (
-                <div key={line.ref ?? line.labelFa} className="flex justify-between text-xs text-slate-600">
-                  <span>
-                    {line.labelFa}
-                    {line.qty ? ` × ${formatNumberFa(line.qty)}` : ''}
-                  </span>
-                  <span className="tabular-fa">{formatToman(line.lineTotal ?? '0', 'full')}</span>
-                </div>
-              ))}
-              <div className="flex justify-between border-t border-slate-200 pt-1 text-xs font-bold text-slate-700">
-                <span>جمع سخت‌افزار</span>
-                <span className="tabular-fa">{formatToman(item.hardwareSubtotal, 'full')}</span>
-              </div>
-            </div>
-          ) : (
-            <p className="text-xs italic text-slate-400">کالا توسط مشتری تأمین می‌شود (بدون هزینه سخت‌افزار).</p>
-          )}
-          <div className="mt-2 space-y-1">
-            {item.laborLines.map((line) => (
-              <div key={line.labelFa} className="flex justify-between text-xs text-slate-600">
-                <span>{line.labelFa}</span>
-                <span className="tabular-fa">{formatToman(line.amount ?? '0', 'full')}</span>
-              </div>
-            ))}
-            {item.appliedComplexities.map((complexity) => (
-              <div key={complexity.labelFa} className="flex justify-between text-[11px] text-amber-600">
-                <span>{complexity.labelFa}</span>
-                <span>×{complexity.multiplier}</span>
-              </div>
-            ))}
-            <div className="flex justify-between text-xs text-slate-600">
-              <span>هزینه اعزام کارشناس</span>
-              <span className="tabular-fa">{formatToman(item.dispatchFee, 'full')}</span>
-            </div>
-          </div>
-        </div>
-      ))}
-
-      <div className="space-y-1.5 border-t border-slate-200 pt-3 text-sm">
-        <div className="flex justify-between text-slate-600">
-          <span>سخت‌افزار (بدون ضریب)</span>
-          <span className="tabular-fa">{formatToman(pricing.summary.totalHardware, 'full')}</span>
-        </div>
-        <div className="flex justify-between text-slate-600">
-          <span>اجرت و اعزام (با ضریب فوریت/شلوغی)</span>
-          <span className="tabular-fa">{formatToman(pricing.summary.dynamicLaborAndDispatch, 'full')}</span>
-        </div>
-        {pricing.summary.bundleDiscountPercent > 0 ? (
-          <div className="flex justify-between font-bold text-emerald-600">
-            <span>تخفیف پکیج {pricing.summary.bundleDiscountPercent}٪</span>
-            <span className="tabular-fa">− {formatToman(pricing.summary.bundleDiscountAmount, 'full')}</span>
-          </div>
+    <section className="card space-y-3" dir="rtl">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <label htmlFor={inputId} className="text-base font-extrabold text-slate-800">تنظیم قیمت بسته اجرا</label>
+        <output htmlFor={inputId} className="tabular-fa rounded-full bg-primary-50 px-3 py-1 text-sm font-extrabold text-primary-900">
+          <bdi dir="ltr">{formatSliderPercent(sliderBps)}</bdi>
+        </output>
+      </div>
+      <input
+        id={inputId}
+        type="range"
+        dir="rtl"
+        min={minDeltaBps / 100}
+        max={maxDeltaBps / 100}
+        step={1}
+        value={sliderBps / 100}
+        aria-valuetext={formatSliderPercent(sliderBps)}
+        aria-describedby={`${inputId}-note ${inputId}-tier`}
+        onChange={(event) => setSliderBps(Number(event.target.value) * 100)}
+        className="w-full cursor-pointer accent-primary-700"
+      />
+      <div className="flex justify-between text-xs text-slate-500" aria-hidden="true">
+        <bdi dir="ltr">{formatSliderPercent(minDeltaBps)}</bdi>
+        <bdi dir="ltr">{formatSliderPercent(maxDeltaBps)}</bdi>
+      </div>
+      <p id={`${inputId}-note`} className="text-xs leading-6 text-slate-600">
+        قیمت تجهیزات ثابت و به نرخ همکار است؛ این نوار فقط بسته اجرا، لجستیک و ضمانت را تنظیم می‌کند.
+      </p>
+      <div className="space-y-1" aria-live="polite">
+        {sliderBps < 0 ? (
+          <span className="chip bg-emerald-50 text-xs font-bold text-emerald-800">{formatToman((standard - selected).toString(), 'full')} صرفه‌جویی</span>
+        ) : priority ? (
+          <span className="chip bg-primary-50 text-xs font-bold text-primary-800">اولویت اعزام <bdi dir="ltr">{formatSliderPercent(sliderBps)}</bdi></span>
         ) : null}
-        <div className="flex justify-between text-lg font-extrabold text-primary-950">
-          <span>برآورد نهایی</span>
-          <span className="tabular-fa">{formatToman(pricing.netEstimated)}</span>
+        <p id={`${inputId}-tier`} className="text-xs font-bold leading-6 text-slate-700">
+          {priority ? 'اولویت با نصاب‌های برتر' : 'باز برای نصاب‌های محبوب و تازه‌کار — اولویت با اولین تأیید'}
+        </p>
+        {isEvaluating ? <p className="text-xs text-slate-500">در حال به‌روزرسانی پیش‌فاکتور…</p> : null}
+      </div>
+      {error ? (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-red-50 p-3 text-xs text-red-700">
+          <p>{error}</p>
+          <button type="button" className="font-extrabold" onClick={() => void evaluate()}>تلاش دوباره</button>
         </div>
-        <p className="text-left text-[11px] text-slate-400">
-          بازه: {formatToman(pricing.estimatedMin)} تا {formatToman(pricing.estimatedMax)}
-        </p>
-      </div>
-
-      <div className="rounded-xl bg-primary-950 p-4 text-white">
-        <p className="flex items-center gap-2 text-sm font-extrabold">
-          <ShieldCheck size={18} className="text-emerald-400" />
-          تعهد ۳گانه هومنتال
-        </p>
-        <p className="mt-1 text-[11px] leading-5 text-primary-200">
-          سخت‌افزار اصل و ماتریکس‌دار + نصب استاندارد توسط تکنسین احراز‌شده + تعهدنامه حریم خصوصی و
-          تغییر رمزهای پیش‌فرض پیش از تحویل.
-        </p>
-      </div>
+      ) : null}
     </section>
   );
 }
@@ -199,6 +200,10 @@ function OrderBridge() {
   const locationType = useAdvisorStore((s) => s.locationType);
   const selected = useAdvisorStore((s) => s.selected);
   const urgency = useAdvisorStore((s) => s.urgency);
+  const sliderBps = useAdvisorStore((s) => s.sliderBps);
+  const pricing = useAdvisorStore((s) => s.pricing);
+  const isEvaluating = useAdvisorStore((s) => s.isEvaluating);
+  const evaluateError = useAdvisorStore((s) => s.evaluateError);
   const selectedOrderId = useAdvisorStore((s) => s.selectedOrderId);
   const setSelectedOrderId = useAdvisorStore((s) => s.setSelectedOrderId);
   const [authOpen, setAuthOpen] = useState(false);
@@ -207,6 +212,7 @@ function OrderBridge() {
   const [address, setAddress] = useState({ titleFa: 'محل نصب', fullAddressFa: '' });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [draftOrderId, setDraftOrderId] = useState<string | null>(null);
 
   useEffect(() => {
     if (accessToken && cities.length === 0) {
@@ -217,7 +223,11 @@ function OrderBridge() {
     }
   }, [accessToken, cities.length]);
 
+  const quoteReady = !isEvaluating && !evaluateError && pricing !== null &&
+    (pricing.slider?.sliderBps ?? 0) === sliderBps;
+
   const submit = async () => {
+    if (!quoteReady || !pricing || !cityId || busy) return;
     setBusy(true);
     setError(null);
     try {
@@ -230,20 +240,26 @@ function OrderBridge() {
         lng: 59.6067,
         isDefault: true,
       });
-      const items = Object.entries(selected)
-        .filter(([, selection]) => selection?.enabled)
-        .map(([serviceKey, selection]) => ({
-          serviceKey,
-          supplyMode: selection!.supplyMode,
-          config: selection!.config,
-        }));
+      const items = Object.entries(selected).flatMap(([serviceKey, selection]) =>
+        selection?.enabled ? [{ serviceKey, supplyMode: selection.supplyMode, config: selection.config }] : [],
+      );
       const order = await api.createOrder({
         addressId: created.id,
         urgency,
         supplyMode: 'FULL_PACKAGE',
+        sliderBps,
         items,
       });
-      const submitted = await api.submitOrder(order.order.id);
+      setDraftOrderId(order.order.id);
+      const current = useAdvisorStore.getState();
+      if (current.isEvaluating || current.evaluateError || current.pricing !== pricing ||
+          !matchesDisplayedInvoice(pricing.invoice, order.estimate.invoice) ||
+          (order.estimate.slider?.sliderBps ?? 0) !== sliderBps ||
+          order.estimate.slider?.dispatchAudience !== pricing.slider?.dispatchAudience) {
+        router.push(`/order/${order.order.id}`);
+        return;
+      }
+      const submitted = await api.submitOrder(order.order.id, sliderBps);
       setSelectedOrderId(submitted.orderId);
       router.push(`/order/${submitted.orderId}`);
     } catch (err) {
@@ -278,6 +294,15 @@ function OrderBridge() {
     );
   }
 
+  if (draftOrderId) {
+    return (
+      <section className="card space-y-3">
+        {error ? <p role="alert" className="rounded-xl bg-red-50 p-3 text-xs font-bold text-red-600">{error}</p> : null}
+        <Link href={`/order/${draftOrderId}`} className="btn-primary w-full">بررسی و ادامه ثبت سفارش</Link>
+      </section>
+    );
+  }
+
   return (
     <section className="card space-y-3">
       <h2 className="flex items-center gap-2 text-base font-extrabold text-slate-800">
@@ -293,7 +318,7 @@ function OrderBridge() {
       <button
         type="button"
         onClick={submit}
-        disabled={busy || address.fullAddressFa.length < 10}
+        disabled={busy || !quoteReady || !cityId || address.fullAddressFa.trim().length < 10}
         className="btn-primary w-full"
       >
         {busy ? <Loader2 size={16} className="animate-spin" /> : 'ثبت پرونده امنیتی و اعزام کارشناس'}
@@ -308,6 +333,7 @@ export function SmartBriefView() {
     <div className="space-y-5">
       <Scorecard />
       <UrgencySelector />
+      <BargainingControl />
       <PricingBreakdown />
       <OrderBridge />
     </div>

@@ -96,9 +96,15 @@ describe('AdminConfigService — PlatformConfig validation & updates', () => {
         maxRadiusMeters: 20000,
         maxRounds: 3,
         maxParallelOffers: 3,
+        priorityThresholdBps: 700,
+        topMinRating: 4.8,
+        topMinReviews: 30,
         weights: { proximity: 0.4, skillMatch: 0.25, rating: 0.2, warrantyClaimRate: 0.15 },
       }),
-    ).resolves.toMatchObject({ key: 'dispatch.offer' });
+    ).resolves.toMatchObject({
+      key: 'dispatch.offer',
+      value: { priorityThresholdBps: 700, topMinRating: 4.8, topMinReviews: 30 },
+    });
   });
 
   it('rejects pricing.surge when maxMultiplier exceeds 1.25 trust cap', async () => {

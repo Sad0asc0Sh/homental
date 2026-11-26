@@ -7,6 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
+import { WalletShortfallException, type WalletShortfallBody } from '../errors/wallet-shortfall.exception';
 
 export interface HttpErrorBody {
   statusCode: number;
@@ -18,7 +19,7 @@ export interface HttpErrorBody {
 
 interface NormalizedError {
   status: number;
-  body: HttpErrorBody;
+  body: HttpErrorBody | WalletShortfallBody;
 }
 
 /** Shared envelope builder used by every exception filter (Part A hotfix #2). */
@@ -33,6 +34,9 @@ export function buildErrorBody(
 
 /** Normalizes any thrown value into the standard error envelope. */
 export function normalizeHttpException(exception: unknown, path: string): NormalizedError {
+  if (exception instanceof WalletShortfallException) {
+    return { status: HttpStatus.CONFLICT, body: exception.body };
+  }
   if (exception instanceof HttpException) {
     const status = exception.getStatus();
     const res = exception.getResponse();

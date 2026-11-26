@@ -5,19 +5,24 @@ import { Roles } from '@common/decorators/roles.decorator';
 import { JwtAuthGuard } from '@common/guards/jwt-auth.guard';
 import { RolesGuard } from '@common/guards/roles.guard';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
+import { DispatchService } from '../dispatch/dispatch.service';
 import { OrdersService } from './orders.service';
 import {
   AssignTechnicianDto,
   CancelOrderDto,
   CreateOrderDto,
   ListOrdersDto,
-  QuoteOrderDto,
+  InspectionScopeDto,
+  SubmitOrderDto,
 } from './dto/orders.dto';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('orders')
 export class OrdersController {
-  constructor(private readonly ordersService: OrdersService) {}
+  constructor(
+    private readonly ordersService: OrdersService,
+    private readonly dispatchService: DispatchService,
+  ) {}
 
   @Roles(UserRole.CUSTOMER)
   @Post()
@@ -37,8 +42,12 @@ export class OrdersController {
 
   @Roles(UserRole.CUSTOMER)
   @Post(':id/submit')
-  async submit(@CurrentUser() actor: AuthenticatedUser, @Param('id', ParseUUIDPipe) id: string) {
-    return this.ordersService.submit(actor, id);
+  async submit(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SubmitOrderDto,
+  ) {
+    return this.ordersService.submit(actor, id, dto);
   }
 
   @Roles(UserRole.BRANCH_ADMIN, UserRole.SUPER_ADMIN)
@@ -57,6 +66,16 @@ export class OrdersController {
     return this.ordersService.assignTechnician(actor, id, dto);
   }
 
+  @Roles(UserRole.BRANCH_ADMIN, UserRole.SUPER_ADMIN)
+  @Post(':id/invite-technician')
+  async inviteTechnician(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: AssignTechnicianDto,
+  ) {
+    return this.dispatchService.inviteTechnician(actor, id, dto.technicianUserId);
+  }
+
   @Roles(UserRole.TECHNICIAN)
   @Post(':id/en-route')
   async enRoute(@CurrentUser() actor: AuthenticatedUser, @Param('id', ParseUUIDPipe) id: string) {
@@ -71,12 +90,18 @@ export class OrdersController {
 
   @Roles(UserRole.TECHNICIAN)
   @Post(':id/quote')
-  async quote(
+  quote() {
+    return this.ordersService.quote();
+  }
+
+  @Roles(UserRole.TECHNICIAN)
+  @Post(':id/inspection-scope')
+  async inspectionScope(
     @CurrentUser() actor: AuthenticatedUser,
     @Param('id', ParseUUIDPipe) id: string,
-    @Body() dto: QuoteOrderDto,
+    @Body() dto: InspectionScopeDto,
   ) {
-    return this.ordersService.quote(actor, id, dto);
+    return this.ordersService.inspectionScope(actor, id, dto);
   }
 
   @Roles(UserRole.CUSTOMER)

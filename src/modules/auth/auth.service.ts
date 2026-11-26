@@ -64,16 +64,21 @@ export class AuthService {
         update: existing?.status === 'PENDING_VERIFICATION' ? { status: 'ACTIVE' } : {},
         create: { phone, role: 'CUSTOMER', status: 'ACTIVE' },
       });
-      await tx.customerProfile.upsert({
-        where: { userId: upserted.id },
-        update: {},
-        create: { userId: upserted.id },
-      });
-      await tx.wallet.upsert({
-        where: { ownerType_ownerId: { ownerType: 'CUSTOMER', ownerId: upserted.id } },
-        update: {},
-        create: { ownerType: 'CUSTOMER', ownerId: upserted.id },
-      });
+      if (upserted.status === 'SUSPENDED' || upserted.status === 'DEACTIVATED') {
+        throw new ForbiddenException('حساب کاربری شما مسدود یا غیرفعال است.');
+      }
+      if (upserted.role === 'CUSTOMER') {
+        await tx.customerProfile.upsert({
+          where: { userId: upserted.id },
+          update: {},
+          create: { userId: upserted.id },
+        });
+        await tx.wallet.upsert({
+          where: { ownerType_ownerId: { ownerType: 'CUSTOMER', ownerId: upserted.id } },
+          update: {},
+          create: { ownerType: 'CUSTOMER', ownerId: upserted.id },
+        });
+      }
       await this.otpService.consumeInTransaction(tx, otp.id);
       return upserted;
     });

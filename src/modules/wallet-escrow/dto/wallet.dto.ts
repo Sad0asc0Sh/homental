@@ -1,13 +1,14 @@
-import { Type } from 'class-transformer';
-import { IsIn, IsInt, IsOptional, IsString, IsUUID, Length, Min } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import { IsIn, IsInt, IsOptional, IsString, IsUUID, Length, Matches, Min } from 'class-validator';
 import { WalletOwnerType } from '@prisma/client';
 
 export class TopUpDto {
-  /** Integer Toman (JSON has no BigInt — converted in the service). */
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  amount!: number;
+  /** Preserve exact Toman strings and accept safe integer numbers from existing clients. */
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value,
+  )
+  @Matches(/^[1-9]\d{0,18}$/, { message: 'مبلغ شارژ باید یک عدد صحیح مثبت به تومان باشد.' })
+  amount!: string;
 
   @IsString()
   @Length(6, 100)

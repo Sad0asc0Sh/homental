@@ -1,41 +1,26 @@
 import {
-  BadRequestException,
-  ForbiddenException,
-  Injectable,
-  NotFoundException,
+  BadRequestException, ConflictException, ForbiddenException, GoneException, Injectable, Logger, NotFoundException,
 } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import type { OrderState, Prisma } from '@prisma/client';
-import { UserRole } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import { NotificationsService } from '@modules/notifications/notifications.service';
 import { WalletEscrowService } from '@modules/wallet-escrow/wallet-escrow.service';
 import { PrismaService } from '@infra/prisma/prisma.service';
+import { MANAGED_PRICING_VERSION, validateSliderBps } from '../pricing/managed-pricing';
 import { PricingService } from '../pricing/pricing.service';
-import type {
-  AssignTechnicianDto,
-  CancelOrderDto,
-  CreateOrderDto,
-  ListOrdersDto,
-  QuoteOrderDto,
-} from './dto/orders.dto';
-import { assertValidTransition, stateFa } from './order-state-machine';
-
-/** BigInt-safe JSON for JSONB snapshots (Invariant 13 — money becomes string). */
-function toJsonSafe<T>(value: T): T {
-  return JSON.parse(
-    JSON.stringify(value, (_key, v: unknown) => (typeof v === 'bigint' ? v.toString() : v)),
-  ) as T;
-}
-
-interface EscrowScope {
-  customerUserId: string;
-  branchId?: string | null;
-  orderId: string;
-}
+import type { AssignTechnicianDto, CancelOrderDto, CreateOrderDto, InspectionScopeDto, ListOrdersDto, SubmitOrderDto } from './dto/orders.dto';
+import { activeManagedRevision, cancelManagedOrder, createManagedRevision, fundManagedOrder, jsonSnapshot } from './managed-order-economics';
+import {
+  ORDER_PROJECTION_INCLUDE, SELLER_FULFILLMENT_INCLUDE, toAdminFinanceView, toBranchOrderView,
+  toCustomerOrderView, toSellerOrderView, toTechnicianOrderView,
+} from './order-projections';
+import { assertValidTransition } from './order-state-machine';
 
 @Injectable()
 export class OrdersService {
+  private readonly logger = new Logger(OrdersService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly pricingService: PricingService,
@@ -44,411 +29,338 @@ export class OrdersService {
     private readonly eventEmitter: EventEmitter2,
   ) {}
 
-  // ── Creation (DRAFT → ESTIMATED with full pricing snapshot) ───────────────
-
   async create(actor: AuthenticatedUser, dto: CreateOrderDto) {
-    const customerProfile = await this.requireCustomerProfile(actor.id);
+    if (actor.role !== 'CUSTOMER') throw new ForbiddenException();
+    const customerProfile = await this.prisma.customerProfile.findUnique({ where: { userId: actor.id } });
+    if (!customerProfile) throw new ForbiddenException('برای ثبت سفارش پروفایل مشتری لازم است.');
     const address = await this.prisma.address.findUnique({
       where: { id: dto.addressId },
       include: { city: true },
     });
     if (!address || address.customerId !== customerProfile.id) {
-      throw new NotFoundException({ statusCode: 404, message: 'آدرس یافت نشد یا متعلق به شما نیست.' });
+      throw new NotFoundException('نشانی مورد نظر یافت نشد.');
     }
     if (dto.securityProfileId) {
-      const securityProfile = await this.prisma.securityProfile.findUnique({
-        where: { id: dto.securityProfileId },
-      });
+      const securityProfile = await this.prisma.securityProfile.findUnique({ where: { id: dto.securityProfileId } });
       if (!securityProfile || securityProfile.customerId !== customerProfile.id) {
-        throw new NotFoundException({ statusCode: 404, message: 'پروفایل امنیتی یافت نشد.' });
+        throw new NotFoundException('پروفایل امنیتی یافت نشد.');
       }
     }
-
     const branch = await this.prisma.branch.findFirst({
       where: { cityId: address.cityId, isActive: true },
+      orderBy: { code: 'asc' },
     });
-
-    const estimate = await this.pricingService.estimate({
+    const price = await this.pricingService.estimateManaged({
       citySlug: address.city.slug,
       lat: Number(address.lat),
       lng: Number(address.lng),
       urgency: dto.urgency,
       supplyMode: dto.supplyMode,
+      sliderBps: dto.sliderBps,
       items: dto.items,
-    });
-
-    const definitionRows = await this.prisma.serviceDefinition.findMany({
+    }, { cityId: address.cityId, branchId: branch?.id ?? null });
+    const definitions = await this.prisma.serviceDefinition.findMany({
       where: { key: { in: dto.items.map((item) => item.serviceKey) }, isActive: true },
       select: { id: true, key: true },
     });
-    const definitionIdByKey = new Map(definitionRows.map((row) => [row.key, row.id]));
+    const definitionIds = new Map(definitions.map(({ key, id }) => [key, id]));
 
-    const orderNumber = this.generateOrderNumber();
     const created = await this.prisma.$transaction(async (db) => {
       const order = await db.serviceOrder.create({
         data: {
-          orderNumber,
-          customerId: actor.id,
-          branchId: branch?.id ?? null,
-          addressId: address.id,
-          securityProfileId: dto.securityProfileId ?? null,
-          state: 'ESTIMATED',
-          locationType: address.locationType,
-          urgency: dto.urgency ?? 'SCHEDULED',
-          supplyMode: dto.supplyMode ?? 'FULL_PACKAGE',
-          lat: address.lat,
-          lng: address.lng,
-          pricing: toJsonSafe(estimate) as unknown as Prisma.InputJsonValue,
-          surgeMultiplier: estimate.factors.surge.multiplier,
-          urgencyMultiplier: estimate.factors.urgency.multiplier,
-          bundleDiscountPercent: estimate.summary.bundleDiscountPercent,
+          orderNumber: this.generateOrderNumber(), customerId: actor.id, branchId: branch?.id,
+          addressId: address.id, securityProfileId: dto.securityProfileId, state: 'ESTIMATED',
+          locationType: address.locationType, urgency: dto.urgency ?? 'SCHEDULED',
+          supplyMode: dto.supplyMode ?? 'FULL_PACKAGE', lat: address.lat, lng: address.lng,
+          pricingVersion: MANAGED_PRICING_VERSION, activeRevision: 1,
+          surgeMultiplier: price.customerView.factors.surge.multiplier,
+          urgencyMultiplier: price.customerView.factors.urgency.multiplier,
+          bundleDiscountPercent: price.customerView.summary.bundleDiscountPercent,
         },
       });
-
+      const orderItemIds = new Map<string, string>();
       for (const item of dto.items) {
-        const definitionId = definitionIdByKey.get(item.serviceKey);
-        if (!definitionId) {
-          throw new BadRequestException({
-            statusCode: 400,
-            message: `سرویس «${item.serviceKey}» فعال نیست.`,
-          });
-        }
-        const breakdown = estimate.items.find((entry) => entry.serviceKey === item.serviceKey);
-        await db.orderItem.create({
+        const definitionId = definitionIds.get(item.serviceKey);
+        if (!definitionId) throw new BadRequestException('خدمت انتخاب‌شده در دسترس نیست.');
+        const saved = await db.orderItem.create({
           data: {
-            orderId: order.id,
-            serviceDefinitionId: definitionId,
-            supplyMode: item.supplyMode ?? dto.supplyMode ?? 'FULL_PACKAGE',
-            config: (item.config ?? {}) as unknown as Prisma.InputJsonValue,
-            pricingSnapshot: toJsonSafe(breakdown ?? null) as unknown as Prisma.InputJsonValue,
+            orderId: order.id, serviceDefinitionId: definitionId, supplyMode: item.supplyMode,
+            config: jsonSnapshot(item.config ?? {}),
           },
         });
+        orderItemIds.set(item.serviceKey, saved.id);
       }
-
+      await createManagedRevision(db, order.id, price, orderItemIds);
+      assertValidTransition('DRAFT', 'ESTIMATED');
       await db.orderStateTransition.createMany({
         data: [
           { orderId: order.id, fromState: null, toState: 'DRAFT', actorUserId: actor.id, actorRole: actor.role, reason: 'ایجاد سفارش' },
-          { orderId: order.id, fromState: 'DRAFT', toState: 'ESTIMATED', actorUserId: actor.id, actorRole: actor.role, reason: 'برآورد قیمت موفق' },
+          { orderId: order.id, fromState: 'DRAFT', toState: 'ESTIMATED', actorUserId: actor.id, actorRole: actor.role, reason: 'ثبت برآورد سفارش' },
         ],
       });
-      return order;
+      return db.serviceOrder.findUniqueOrThrow({ where: { id: order.id }, include: ORDER_PROJECTION_INCLUDE });
     });
-
-    return { order: created, estimate: toJsonSafe(estimate) };
+    return { order: toCustomerOrderView(created), estimate: price.customerView };
   }
 
-  // ── Role-scoped reads ─────────────────────────────────────────────────────
-
-  private listWhereFor(actor: AuthenticatedUser): { customerId?: string; technicianId?: string; branchId?: string | null } {
+  private orderScope(actor: AuthenticatedUser): Prisma.ServiceOrderWhereInput | null {
     switch (actor.role) {
-      case UserRole.CUSTOMER:
-        return { customerId: actor.id };
-      case UserRole.TECHNICIAN:
-        return { technicianId: actor.id };
-      case UserRole.BRANCH_ADMIN:
-        // An unassigned branch admin sees NOTHING (never an all-branch query).
-        return { branchId: actor.branchId ?? '__none__' };
-      case UserRole.SUPER_ADMIN:
-      default:
-        return {};
+      case 'CUSTOMER': return { customerId: actor.id };
+      case 'TECHNICIAN': return { technicianId: actor.id };
+      case 'BRANCH_ADMIN': return actor.branchId ? { branchId: actor.branchId } : null;
+      case 'SUPER_ADMIN': return {};
+      default: throw new ForbiddenException();
     }
   }
 
   async list(actor: AuthenticatedUser, query: ListOrdersDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
-    const where = this.listWhereFor(actor);
-    if (where.branchId === '__none__') {
-      return { items: [], total: 0, page, limit };
-    }
-    const [items, total] = await Promise.all([
+    if (actor.role === 'SELLER') return this.listSellerFulfillments(actor, page, limit);
+    const where = this.orderScope(actor);
+    if (!where) return { items: [], total: 0, page, limit };
+    const [orders, total] = await Promise.all([
       this.prisma.serviceOrder.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-        include: {
-          items: { include: { serviceDefinition: { select: { key: true, titleFa: true } } } },
-        },
+        where, orderBy: { createdAt: 'desc' }, skip: (page - 1) * limit, take: limit,
+        include: { ...ORDER_PROJECTION_INCLUDE, transactions: actor.role === 'SUPER_ADMIN' },
       }),
       this.prisma.serviceOrder.count({ where }),
     ]);
-    return { items, total, page, limit };
-  }
-
-  private async requireVisibleOrder(actor: AuthenticatedUser, orderId: string) {
-    const order = await this.prisma.serviceOrder.findUnique({ where: { id: orderId } });
-    if (!order) {
-      throw new NotFoundException({ statusCode: 404, message: 'سفارش یافت نشد.' });
-    }
-    const allowed =
-      actor.role === UserRole.SUPER_ADMIN ||
-      (actor.role === UserRole.CUSTOMER && order.customerId === actor.id) ||
-      (actor.role === UserRole.TECHNICIAN && order.technicianId === actor.id) ||
-      (actor.role === UserRole.BRANCH_ADMIN &&
-        actor.branchId !== null &&
-        order.branchId === actor.branchId);
-    if (!allowed) {
-      throw new NotFoundException({ statusCode: 404, message: 'سفارش یافت نشد.' });
-    }
-    return order;
+    return { items: orders.map((order) => this.projectOrder(actor, order)), total, page, limit };
   }
 
   async getOne(actor: AuthenticatedUser, orderId: string) {
-    await this.requireVisibleOrder(actor, orderId);
-    return this.prisma.serviceOrder.findUnique({
-      where: { id: orderId },
+    if (actor.role === 'SELLER') {
+      const shipment = await this.prisma.supplyFulfillment.findFirst({
+        where: { orderId, seller: { userId: actor.id } },
+        include: SELLER_FULFILLMENT_INCLUDE,
+      });
+      if (!shipment) throw new NotFoundException('سفارش یافت نشد.');
+      return toSellerOrderView(shipment);
+    }
+    const where = this.orderScope(actor);
+    if (!where) throw new NotFoundException('سفارش یافت نشد.');
+    const order = await this.prisma.serviceOrder.findUnique({
+      where: { id: orderId, AND: [where] },
       include: {
-        items: { include: { serviceDefinition: { select: { key: true, titleFa: true } } } },
+        ...ORDER_PROJECTION_INCLUDE, review: true,
         stateTransitions: { orderBy: { createdAt: 'asc' } },
-        review: true,
+        transactions: actor.role === 'SUPER_ADMIN',
       },
     });
+    if (!order) throw new NotFoundException('سفارش یافت نشد.');
+    return this.projectOrder(actor, order);
   }
 
-  // ── Customer & staff actions (guarded transitions) ────────────────────────
-
-  async submit(actor: AuthenticatedUser, orderId: string) {
-    const order = await this.requireVisibleOrder(actor, orderId);
-    if (order.customerId !== actor.id) {
-      throw new ForbiddenException({ statusCode: 403, message: 'فقط سفارش‌های خودتان قابل ارسال هستند.' });
-    }
-    await this.simpleTransition(order.id, order.state, 'SEARCHING_EXPERT', actor, 'درخواست جستجوی تکنسین');
-    await this.notificationsService.send({
-      userId: actor.id,
-      type: 'ORDER_STATUS_CHANGED',
-      titleFa: 'سفارش شما ثبت شد',
-      bodyFa: `سفارش ${order.orderNumber} در حال جستجوی تکنسین مناسب است.`,
-      data: { orderId: order.id, state: 'SEARCHING_EXPERT' },
+  async listSellerFulfillments(actor: AuthenticatedUser, page?: number, limit?: number) {
+    if (actor.role !== 'SELLER') throw new ForbiddenException();
+    const where = { seller: { userId: actor.id } };
+    const shipments = await this.prisma.supplyFulfillment.findMany({
+      where, orderBy: { createdAt: 'desc' }, include: SELLER_FULFILLMENT_INCLUDE,
+      ...(page !== undefined && limit !== undefined ? { skip: (page - 1) * limit, take: limit } : {}),
     });
-    // Part A: auto-kickoff the first dispatch wave without a circular DI
-    // dependency — DispatchService listens on this domain event.
-    this.eventEmitter.emit('order.searching', { orderId: order.id });
-    return { orderId: order.id, state: 'SEARCHING_EXPERT' };
+    const items = shipments.map(toSellerOrderView);
+    if (page === undefined || limit === undefined) return items;
+    const total = await this.prisma.supplyFulfillment.count({ where });
+    return { items, total, page, limit };
   }
 
-  async branchQueue(actor: AuthenticatedUser, orderId: string) {
-    const order = await this.requireVisibleOrder(actor, orderId);
-    await this.simpleTransition(order.id, order.state, 'BRANCH_QUEUE', actor, 'ارسال به صف شعبه');
-    return { orderId: order.id, state: 'BRANCH_QUEUE' };
-  }
-
-  async assignTechnician(actor: AuthenticatedUser, orderId: string, dto: AssignTechnicianDto) {
-    const order = await this.requireVisibleOrder(actor, orderId);
-    if (order.branchId && actor.role === UserRole.BRANCH_ADMIN && actor.branchId !== order.branchId) {
-      throw new ForbiddenException({ statusCode: 403, message: 'شما فقط به سفارش‌های شعبه خودتان دسترسی دارید.' });
+  private projectOrder(actor: AuthenticatedUser, order: Parameters<typeof toAdminFinanceView>[1]) {
+    // Recheck ownership at projection time as well as in the database query.
+    switch (actor.role) {
+      case 'CUSTOMER':
+        if (order.customerId === actor.id) return toCustomerOrderView(order);
+        break;
+      case 'TECHNICIAN':
+        if (order.technicianId === actor.id) return toTechnicianOrderView(order);
+        break;
+      case 'BRANCH_ADMIN':
+        if (actor.branchId && order.branchId === actor.branchId) return toBranchOrderView(order);
+        break;
+      case 'SUPER_ADMIN': return toAdminFinanceView(actor.role, order);
+      default: throw new ForbiddenException();
     }
-    const technician = await this.prisma.technicianProfile.findUnique({
-      where: { userId: dto.technicianUserId },
-    });
-    if (!technician || technician.status !== 'APPROVED') {
-      throw new BadRequestException({ statusCode: 400, message: 'تکنسین انتخابی تأیید‌شده نیست.' });
-    }
-    if (order.branchId && technician.branchId !== order.branchId) {
-      throw new BadRequestException({ statusCode: 400, message: 'تکنسین انتخابی متعلق به شعبه این سفارش نیست.' });
-    }
-
-    await this.prisma.$transaction(async (db) => {
-      await this.transition(db, order.id, order.state, 'EXPERT_ASSIGNED', actor, 'اختصاص تکنسین', {
-        technicianUserId: dto.technicianUserId,
-      });
-      await db.serviceOrder.update({
-        where: { id: order.id },
-        data: { technicianId: dto.technicianUserId },
-      });
-    });
-
-    await Promise.all([
-      this.notificationsService.send({
-        userId: dto.technicianUserId,
-        type: 'ORDER_STATUS_CHANGED',
-        titleFa: 'سفارش جدید به شما اختصاص یافت',
-        bodyFa: `سفارش ${order.orderNumber} به شما اختصاص یافت.`,
-        data: { orderId: order.id, state: 'EXPERT_ASSIGNED' },
-      }),
-      this.notificationsService.send({
-        userId: order.customerId,
-        type: 'ORDER_STATUS_CHANGED',
-        titleFa: 'تکنسین شما انتخاب شد',
-        bodyFa: `برای سفارش ${order.orderNumber} تکنسین اختصاص یافت.`,
-        data: { orderId: order.id, state: 'EXPERT_ASSIGNED' },
-      }),
-    ]);
-    return { orderId: order.id, state: 'EXPERT_ASSIGNED', technicianId: dto.technicianUserId };
+    throw new NotFoundException('سفارش یافت نشد.');
   }
 
-  async enRoute(actor: AuthenticatedUser, orderId: string) {
-    return this.technicianTransition(actor, orderId, 'ON_THE_WAY', 'تکنسین در مسیر است');
-  }
-
-  async startInspection(actor: AuthenticatedUser, orderId: string) {
-    return this.technicianTransition(actor, orderId, 'INSPECTING', 'شروع بازدید و کارشناسی');
-  }
-
-  async quote(actor: AuthenticatedUser, orderId: string, dto: QuoteOrderDto) {
-    const order = await this.requireAssignedOrder(actor, orderId);
-    if (order.state !== 'INSPECTING') {
-      throw new BadRequestException({
-        statusCode: 400,
-        message: `ثبت پیش‌فاکتور فقط در وضعیت «${stateFa('INSPECTING')}» ممکن است.`,
-      });
-    }
-    const finalQuoteAmount = BigInt(dto.finalQuoteAmount);
-    // Part A hardening: a non-positive quote is never acceptable.
-    if (finalQuoteAmount <= 0n) {
-      throw new BadRequestException({
-        statusCode: 400,
-        message: 'مبلغ پیش‌فاکتور باید بزرگ‌تر از صفر باشد.',
-      });
-    }
-    await this.prisma.serviceOrder.update({
-      where: { id: order.id },
-      data: { finalQuoteAmount },
-    });
-    await this.notificationsService.send({
-      userId: order.customerId,
-      type: 'ORDER_STATUS_CHANGED',
-      titleFa: 'پیش‌فاکتور نهایی آماده است',
-      bodyFa: `پیش‌فاکتور سفارش ${order.orderNumber} ثبت شد؛ برای شروع نصب، مبلغ را تأیید کنید.`,
-      data: { orderId: order.id, finalQuoteAmount: dto.finalQuoteAmount },
-    });
-    return { orderId: order.id, finalQuoteAmount: dto.finalQuoteAmount };
-  }
-
-  async approveQuote(actor: AuthenticatedUser, orderId: string) {
-    const order = await this.requireVisibleOrder(actor, orderId);
-    if (order.customerId !== actor.id) {
-      throw new ForbiddenException({ statusCode: 403, message: 'فقط مشتری سفارش می‌تواند پیش‌فاکتور را تأیید کند.' });
-    }
-    if (order.state !== 'INSPECTING' || !order.finalQuoteAmount) {
-      throw new BadRequestException({
-        statusCode: 400,
-        message: 'تأیید پیش‌فاکتور نیازمند ثبت مبلغ نهایی توسط تکنسین در وضعیت بازدید است.',
-      });
-    }
-    const escrowAmount = order.finalQuoteAmount;
-
-    const escrowScope: EscrowScope = { customerUserId: actor.id, orderId: order.id };
-    await this.prisma.$transaction(async (db) => {
-      await this.walletEscrowService.holdEscrow(
-        {
-          customerUserId: escrowScope.customerUserId,
-          orderId: escrowScope.orderId,
-          amount: escrowAmount,
-          idempotencyKey: `escrow:hold:${order.id}`,
-        },
-        db,
-      );
-      await this.transition(db, order.id, order.state, 'QUOTE_APPROVED', actor, 'تأیید پیش‌فاکتور و مسدودسازی اسکرو');
-    });
-
-    await this.notificationsService.send({
-      userId: order.technicianId ?? actor.id,
-      type: 'ORDER_STATUS_CHANGED',
-      titleFa: 'پیش‌فاکتور تأیید شد',
-      bodyFa: `مشتری پیش‌فاکتور سفارش ${order.orderNumber} را تأیید کرد؛ مبلغ در اسکرو مسدود شد.`,
-      data: { orderId: order.id, state: 'QUOTE_APPROVED' },
-    });
-    return { orderId: order.id, state: 'QUOTE_APPROVED' };
-  }
-
-  async startWork(actor: AuthenticatedUser, orderId: string) {
-    return this.technicianTransition(actor, orderId, 'IN_PROGRESS', 'شروع عملیات نصب');
-  }
-
-  async cancel(actor: AuthenticatedUser, orderId: string, dto: CancelOrderDto) {
-    const order = await this.requireVisibleOrder(actor, orderId);
-    const isOwner = actor.role === UserRole.CUSTOMER && order.customerId === actor.id;
-    const isBranchAdminOfOrder =
-      actor.role === UserRole.BRANCH_ADMIN &&
-      actor.branchId !== null &&
-      order.branchId === actor.branchId;
-    if (!isOwner && !isBranchAdminOfOrder && actor.role !== UserRole.SUPER_ADMIN) {
-      throw new ForbiddenException({ statusCode: 403, message: 'شما مجاز به لغو این سفارش نیستید.' });
-    }
-
-    assertValidTransition(order.state, 'CANCELLED'); // 409 for IN_PROGRESS+
-    const escrowAmount = order.finalQuoteAmount;
-
-    await this.prisma.$transaction(async (db) => {
-      if (order.state === 'QUOTE_APPROVED' && escrowAmount !== null) {
-        // Escrow already held → refund atomically with the cancellation.
-        await this.walletEscrowService.refundEscrow(
-          {
-            customerUserId: order.customerId,
-            orderId: order.id,
-            amount: escrowAmount,
-            idempotencyKey: `escrow:refund:${order.id}`,
-            reason: dto.reason,
-          },
-          db,
-        );
-      }
-      const updated = await db.serviceOrder.updateMany({
-        where: { id: order.id, state: order.state },
-        data: {
-          state: 'CANCELLED',
-          cancelReason: dto.reason,
-          cancelledAt: new Date(),
-          cancelledByUserId: actor.id,
-        },
-      });
-      if (updated.count === 0) {
-        throw new BadRequestException({ statusCode: 409, message: 'وضعیت سفارش تغییر کرده است؛ دوباره تلاش کنید.' });
-      }
-      await db.orderStateTransition.create({
-        data: {
-          orderId: order.id,
-          fromState: order.state,
-          toState: 'CANCELLED',
-          actorUserId: actor.id,
-          actorRole: actor.role,
-          reason: dto.reason ?? 'لغو سفارش',
-        },
-      });
-    });
-
-    return { orderId: order.id, state: 'CANCELLED' };
-  }
-
-  // ── Internal helpers ──────────────────────────────────────────────────────
-
-  private async technicianTransition(
-    actor: AuthenticatedUser,
-    orderId: string,
-    toState: OrderState,
-    reason: string,
-  ) {
-    const order = await this.requireAssignedOrder(actor, orderId);
-    await this.simpleTransition(order.id, order.state, toState, actor, reason);
-    return { orderId: order.id, state: toState };
-  }
-
-  private async requireAssignedOrder(actor: AuthenticatedUser, orderId: string) {
-    if (actor.role !== UserRole.TECHNICIAN) {
-      throw new ForbiddenException({ statusCode: 403, message: 'این عملیات مخصوص تکنسین سفارش است.' });
-    }
-    const order = await this.prisma.serviceOrder.findUnique({ where: { id: orderId } });
-    if (!order || order.technicianId !== actor.id) {
-      throw new NotFoundException({ statusCode: 404, message: 'سفارش یافت نشد.' });
+  private async requireVisibleOrder(actor: AuthenticatedUser, orderId: string) {
+    const where = this.orderScope(actor);
+    if (!where) throw new NotFoundException('سفارش یافت نشد.');
+    const order = await this.prisma.serviceOrder.findUnique({ where: { id: orderId, AND: [where] } });
+    if (!order ||
+        (actor.role === 'CUSTOMER' && order.customerId !== actor.id) ||
+        (actor.role === 'TECHNICIAN' && order.technicianId !== actor.id) ||
+        (actor.role === 'BRANCH_ADMIN' && order.branchId !== actor.branchId)) {
+      throw new NotFoundException('سفارش یافت نشد.');
     }
     return order;
   }
 
-  private async simpleTransition(
-    orderId: string,
-    fromState: OrderState,
-    toState: OrderState,
-    actor: AuthenticatedUser,
-    reason: string,
-    metadata?: Record<string, unknown>,
-  ): Promise<void> {
+  async submit(actor: AuthenticatedUser, orderId: string, dto: SubmitOrderDto = {}) {
+    if (actor.role !== 'CUSTOMER') throw new ForbiddenException();
+    if (dto.sliderBps !== undefined) validateSliderBps(dto.sliderBps);
+    const order = await this.requireVisibleOrder(actor, orderId);
+    if (order.pricingVersion !== MANAGED_PRICING_VERSION) {
+      throw new ConflictException('این برآورد متعلق به نسخه قدیمی قیمت‌گذاری است. سفارش تازه‌ای ثبت کنید.');
+    }
+    if (order.state !== 'ESTIMATED') {
+      const position = await this.prisma.escrowPosition.findUnique({ where: { orderId } });
+      if (position && position.status !== 'REFUNDED') {
+        if (dto.sliderBps !== undefined) {
+          const revision = await activeManagedRevision(this.prisma, order);
+          if (revision?.sliderBps !== dto.sliderBps) {
+            throw new ConflictException('درصد بسته پس از ثبت سفارش قابل تغییر نیست.');
+          }
+        }
+        return { orderId, state: order.state };
+      }
+    }
     await this.prisma.$transaction(async (db) => {
-      await this.transition(db, orderId, fromState, toState, actor, reason, metadata);
+      await this.transition(db, order.id, order.state, 'SEARCHING_EXPERT', actor, 'تأمین مالی و درخواست اعزام تکنسین');
+      await fundManagedOrder(db, this.walletEscrowService, order, dto.sliderBps);
     });
+    this.eventEmitter.emit('order.searching', { orderId });
+    await this.notify({
+      userId: actor.id, type: 'ORDER_STATUS_CHANGED', titleFa: 'سفارش ثبت شد',
+      bodyFa: `وجه سفارش ${order.orderNumber} در امانت است و جستجوی تکنسین شروع شد.`,
+      data: { orderId, state: 'SEARCHING_EXPERT' },
+    });
+    return { orderId, state: 'SEARCHING_EXPERT' };
   }
 
-  /** Optimistic guarded transition + append-only audit row (Invariant 8). */
+  async branchQueue(actor: AuthenticatedUser, orderId: string) {
+    this.assertDispatcher(actor);
+    const order = await this.requireVisibleOrder(actor, orderId);
+    await this.prisma.$transaction(async (db) => {
+      await this.transition(db, order.id, order.state, 'BRANCH_QUEUE', actor, 'انتقال به صف شعبه', { technicianId: null });
+      await db.dispatchOffer.updateMany({
+        where: { orderId, status: 'PENDING' }, data: { status: 'CANCELLED', respondedAt: new Date() },
+      });
+    });
+    return { orderId, state: 'BRANCH_QUEUE' };
+  }
+
+  async assignTechnician(actor: AuthenticatedUser, orderId: string, dto: AssignTechnicianDto) {
+    this.assertDispatcher(actor);
+    const order = await this.requireVisibleOrder(actor, orderId);
+    if (order.pricingVersion === MANAGED_PRICING_VERSION) {
+      throw new GoneException('برای سفارش تأمین‌شده، دعوت‌نامه پذیرش برای تکنسین ارسال کنید.');
+    }
+    const technician = await this.prisma.technicianProfile.findUnique({ where: { userId: dto.technicianUserId } });
+    if (!technician || technician.status !== 'APPROVED' || (order.branchId && technician.branchId !== order.branchId)) {
+      throw new BadRequestException('تکنسین انتخابی برای این شعبه قابل اعزام نیست.');
+    }
+    await this.prisma.$transaction((db) =>
+      this.transition(db, order.id, order.state, 'EXPERT_ASSIGNED', actor, 'تخصیص تکنسین', { technicianId: dto.technicianUserId }),
+    );
+    await Promise.all([
+      this.notify({
+        userId: dto.technicianUserId, type: 'ORDER_STATUS_CHANGED', titleFa: 'سفارش جدید',
+        bodyFa: `سفارش ${order.orderNumber} به شما اختصاص یافت.`, data: { orderId, state: 'EXPERT_ASSIGNED' },
+      }),
+      this.notify({
+        userId: order.customerId, type: 'ORDER_STATUS_CHANGED', titleFa: 'تکنسین انتخاب شد',
+        bodyFa: `تکنسین سفارش ${order.orderNumber} انتخاب شد.`, data: { orderId, state: 'EXPERT_ASSIGNED' },
+      }),
+    ]);
+    return { orderId, state: 'EXPERT_ASSIGNED', technicianId: dto.technicianUserId };
+  }
+
+  async enRoute(actor: AuthenticatedUser, orderId: string) {
+    return this.technicianTransition(actor, orderId, 'ON_THE_WAY', 'تکنسین در راه است');
+  }
+
+  async startInspection(actor: AuthenticatedUser, orderId: string) {
+    return this.technicianTransition(actor, orderId, 'INSPECTING', 'شروع بازدید محل');
+  }
+
+  quote(): never {
+    throw new GoneException('تعیین قیمت دستی توسط تکنسین غیرفعال شده است؛ از تأیید دامنه کار استفاده کنید.');
+  }
+
+  async inspectionScope(actor: AuthenticatedUser, orderId: string, dto: InspectionScopeDto) {
+    if (actor.role !== 'TECHNICIAN') throw new ForbiddenException();
+    const order = await this.requireVisibleOrder(actor, orderId);
+    if (!dto.matchesFrozenScope || dto.revision !== order.activeRevision || order.pricingVersion !== MANAGED_PRICING_VERSION) {
+      throw new ConflictException('دامنه کار با نسخه توافق‌شده مطابقت ندارد.');
+    }
+    if (order.state === 'IN_PROGRESS') return { orderId, state: 'IN_PROGRESS' };
+    await this.prisma.$transaction(async (db) => {
+      const [revision, escrow] = await Promise.all([
+        activeManagedRevision(db, order),
+        db.escrowPosition.findUnique({ where: { orderId } }),
+      ]);
+      if (revision?.status !== 'FUNDED' || escrow?.status !== 'OPEN' || escrow.activeRevision !== dto.revision) {
+        throw new ConflictException('نسخه تأمین مالی شده سفارش در دسترس نیست.');
+      }
+      const guard = { activeRevision: dto.revision, technicianId: actor.id };
+      await this.transition(db, orderId, order.state, 'QUOTE_APPROVED', actor, 'تأیید تطابق دامنه کار', {}, guard);
+      await this.transition(db, orderId, 'QUOTE_APPROVED', 'IN_PROGRESS', actor, 'شروع اجرای سفارش', {}, guard);
+    });
+    return { orderId, state: 'IN_PROGRESS' };
+  }
+
+  async approveQuote(actor: AuthenticatedUser, orderId: string) {
+    if (actor.role !== 'CUSTOMER') throw new ForbiddenException();
+    const order = await this.requireVisibleOrder(actor, orderId);
+    if (order.pricingVersion === MANAGED_PRICING_VERSION) {
+      throw new GoneException('وجه این سفارش هنگام ثبت در امانت قرار می‌گیرد.');
+    }
+    if (order.state !== 'INSPECTING' || !order.finalQuoteAmount) {
+      throw new BadRequestException('پیش‌فاکتور قابل تأیید برای این سفارش یافت نشد.');
+    }
+    const amount = order.finalQuoteAmount;
+    await this.prisma.$transaction(async (db) => {
+      await this.transition(db, order.id, order.state, 'QUOTE_APPROVED', actor, 'تأیید پیش‌فاکتور و امانت وجه');
+      await this.walletEscrowService.holdEscrow({
+        customerUserId: actor.id, orderId, amount, idempotencyKey: `escrow:hold:${order.id}`,
+      }, db);
+    });
+    await this.notify({
+      userId: order.technicianId ?? actor.id, type: 'ORDER_STATUS_CHANGED', titleFa: 'پیش‌فاکتور تأیید شد',
+      bodyFa: `پیش‌فاکتور سفارش ${order.orderNumber} تأیید شد.`, data: { orderId, state: 'QUOTE_APPROVED' },
+    });
+    return { orderId, state: 'QUOTE_APPROVED' };
+  }
+
+  async startWork(actor: AuthenticatedUser, orderId: string) {
+    return this.technicianTransition(actor, orderId, 'IN_PROGRESS', 'شروع اجرای سفارش');
+  }
+
+  async cancel(actor: AuthenticatedUser, orderId: string, dto: CancelOrderDto) {
+    if (actor.role !== 'CUSTOMER' && actor.role !== 'BRANCH_ADMIN' && actor.role !== 'SUPER_ADMIN') {
+      throw new ForbiddenException();
+    }
+    const order = await this.requireVisibleOrder(actor, orderId);
+    if (order.state === 'CANCELLED') return { orderId, state: 'CANCELLED' };
+    await this.prisma.$transaction(async (db) => {
+      await this.transition(db, orderId, order.state, 'CANCELLED', actor, dto.reason ?? 'لغو سفارش', {
+        cancelReason: dto.reason, cancelledAt: new Date(), cancelledByUserId: actor.id,
+      });
+      if (order.pricingVersion === MANAGED_PRICING_VERSION) {
+        await cancelManagedOrder(db, this.walletEscrowService, order, dto.reason);
+      } else if (order.state === 'QUOTE_APPROVED' && order.finalQuoteAmount !== null) {
+        await this.walletEscrowService.refundEscrow({
+          customerUserId: order.customerId, orderId, amount: order.finalQuoteAmount,
+          idempotencyKey: `escrow:refund:${order.id}`, reason: dto.reason,
+        }, db);
+      }
+      await db.dispatchOffer.updateMany({
+        where: { orderId, status: 'PENDING' }, data: { status: 'CANCELLED', respondedAt: new Date() },
+      });
+    });
+    return { orderId, state: 'CANCELLED' };
+  }
+
+  private async technicianTransition(actor: AuthenticatedUser, orderId: string, toState: OrderState, reason: string) {
+    if (actor.role !== 'TECHNICIAN') throw new ForbiddenException();
+    const order = await this.requireVisibleOrder(actor, orderId);
+    await this.prisma.$transaction((db) =>
+      this.transition(db, order.id, order.state, toState, actor, reason, {}, { technicianId: actor.id }),
+    );
+    return { orderId, state: toState };
+  }
+
   private async transition(
     db: Prisma.TransactionClient,
     orderId: string,
@@ -456,43 +368,34 @@ export class OrdersService {
     toState: OrderState,
     actor: AuthenticatedUser,
     reason: string,
-    metadata?: Record<string, unknown>,
-  ): Promise<void> {
+    data: Prisma.ServiceOrderUncheckedUpdateManyInput = {},
+    guard: Prisma.ServiceOrderWhereInput = {},
+  ) {
     assertValidTransition(fromState, toState);
     const updated = await db.serviceOrder.updateMany({
-      where: { id: orderId, state: fromState },
-      data: { state: toState },
+      where: { id: orderId, state: fromState, ...guard },
+      data: { ...data, state: toState },
     });
-    if (updated.count === 0) {
-      throw new BadRequestException({
-        statusCode: 409,
-        message: 'وضعیت سفارش هم‌زمان تغییر کرده است؛ دوباره تلاش کنید.',
-      });
-    }
+    if (updated.count !== 1) throw new ConflictException('وضعیت سفارش تغییر کرده است. دوباره تلاش کنید.');
     await db.orderStateTransition.create({
-      data: {
-        orderId,
-        fromState,
-        toState,
-        actorUserId: actor.id,
-        actorRole: actor.role,
-        reason,
-        metadata: (metadata ?? undefined) as Prisma.InputJsonValue | undefined,
-      },
+      data: { orderId, fromState, toState, actorUserId: actor.id, actorRole: actor.role, reason },
     });
   }
 
-  private async requireCustomerProfile(userId: string) {
-    const profile = await this.prisma.customerProfile.findUnique({ where: { userId } });
-    if (!profile) {
-      throw new ForbiddenException({ statusCode: 403, message: 'فقط کاربران مشتری می‌توانند سفارش ثبت کنند.' });
-    }
-    return profile;
+  private assertDispatcher(actor: AuthenticatedUser) {
+    if (actor.role !== 'BRANCH_ADMIN' && actor.role !== 'SUPER_ADMIN') throw new ForbiddenException();
   }
 
-  private generateOrderNumber(): string {
-    const year = new Date().getFullYear();
+  private async notify(notification: Parameters<NotificationsService['send']>[0]) {
+    try {
+      await this.notificationsService.send(notification);
+    } catch (error) {
+      this.logger.warn(`Order notification failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private generateOrderNumber() {
     const serial = Math.floor(100_000 + Math.random() * 900_000);
-    return `HM-${year}-${serial}`;
+    return `HM-${new Date().getFullYear()}-${serial}`;
   }
 }

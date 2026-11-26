@@ -47,7 +47,7 @@ export function PillarsShowcase({
   onToggle,
 }: {
   catalog: CatalogResponse | null;
-  selected?: Partial<Record<string, unknown>>;
+  selected?: Partial<Record<string, { enabled: boolean }>>;
   onToggle?: (key: string) => void;
 }) {
   if (!catalog) {
@@ -74,7 +74,11 @@ export function PillarsShowcase({
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {pillar.services.map((service) => {
               const Icon = serviceIcon(service.iconKey);
-              const isEnabled = selected?.[service.key] != null;
+              // IMPORTANT: check the ENABLED flag, not mere entry existence —
+              // a toggled-off service keeps its store entry (enabled: false),
+              // and with `!= null` the card would freeze on «انتخاب‌شده»
+              // while the logic actually applied (the reported UI bug).
+              const isEnabled = selected?.[service.key]?.enabled === true;
               return (
                 <button
                   key={service.key}

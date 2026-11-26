@@ -37,6 +37,9 @@ interface ConfigFormsState {
     maxRadiusMeters: string;
     maxRounds: string;
     maxParallelOffers: string;
+    priorityThresholdBps: number | undefined;
+    topMinRating: number | undefined;
+    topMinReviews: number | undefined;
     weights: {
       proximity: string;
       skillMatch: string;
@@ -95,6 +98,9 @@ function hydrateForms(entries: PlatformConfigEntry[]): ConfigFormsState {
       maxRadiusMeters: String(dispatch['maxRadiusMeters'] ?? 20000),
       maxRounds: String(dispatch['maxRounds'] ?? 3),
       maxParallelOffers: String(dispatch['maxParallelOffers'] ?? 3),
+      priorityThresholdBps: typeof dispatch.priorityThresholdBps === 'number' ? dispatch.priorityThresholdBps : undefined,
+      topMinRating: typeof dispatch.topMinRating === 'number' ? dispatch.topMinRating : undefined,
+      topMinReviews: typeof dispatch.topMinReviews === 'number' ? dispatch.topMinReviews : undefined,
       weights: {
         proximity: String(weights['proximity'] ?? 0.35),
         skillMatch: String(weights['skillMatch'] ?? 0.25),
@@ -569,6 +575,9 @@ export function PlatformConfigTab() {
               maxRadiusMeters: n(forms.dispatchOffer.maxRadiusMeters),
               maxRounds: n(forms.dispatchOffer.maxRounds),
               maxParallelOffers: n(forms.dispatchOffer.maxParallelOffers),
+              priorityThresholdBps: forms.dispatchOffer.priorityThresholdBps,
+              topMinRating: forms.dispatchOffer.topMinRating,
+              topMinReviews: forms.dispatchOffer.topMinReviews,
               weights: {
                 proximity: n(forms.dispatchOffer.weights.proximity),
                 skillMatch: n(forms.dispatchOffer.weights.skillMatch),

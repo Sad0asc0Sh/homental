@@ -1,5 +1,6 @@
 import { BadRequestException } from '@nestjs/common';
 import { z } from 'zod';
+import { DEFAULT_DISPATCH_PRIORITY, dispatchPrioritySchema } from '../security-services/dispatch/dispatch-priority-policy';
 
 const bundleDiscountSchema = z
   .object({
@@ -67,6 +68,7 @@ const dispatchOfferSchema = z
     maxRadiusMeters: z.number().int().min(1000).max(100_000),
     maxRounds: z.number().int().min(1).max(10),
     maxParallelOffers: z.number().int().min(1).max(10),
+    ...dispatchPrioritySchema.partial().shape,
     weights: z
       .object({
         proximity: z.number().min(0).max(1),
@@ -114,6 +116,7 @@ export const PLATFORM_CONFIG_DEFAULTS: Record<string, Record<string, unknown>> =
     warrantyReserveRate: 0.05,
   },
   'dispatch.offer': {
+    ...DEFAULT_DISPATCH_PRIORITY,
     ttlSeconds: 30,
     initialRadiusMeters: 5000,
     radiusStepMeters: 7000,

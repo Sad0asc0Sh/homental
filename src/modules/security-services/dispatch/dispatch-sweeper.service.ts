@@ -1,5 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { OrderState } from '@prisma/client';
+import { AppConfigService } from '@config/app-config.service';
 import { PrismaService } from '@infra/prisma/prisma.service';
 import { DispatchService } from './dispatch.service';
 
@@ -8,29 +9,33 @@ const SWEEPER_INTERVAL_MS = 15_000;
 /**
  * Marks PENDING offers past their TTL as EXPIRED, then re-waves (or
  * BRANCH_QUEUE-falls-back) every SEARCHING_EXPERT order with zero remaining
- * live offers. Runs on a self-managed interval (no extra scheduler dep).
+ * live offers. An expired TOP wave reopens its initial radius to all tiers.
  */
 @Injectable()
 export class DispatchSweeperService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DispatchSweeperService.name);
   private intervalRef: ReturnType<typeof setInterval> | undefined;
+  private sweeping = false;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly dispatchService: DispatchService,
+    private readonly config: AppConfigService,
   ) {}
 
   onModuleInit(): void {
     // Tests drive expireStaleOffers() explicitly — no live timer there.
-    if (process.env['NODE_ENV'] === 'test') return;
+    if (this.config.nodeEnv === 'test') return;
     this.intervalRef = setInterval(() => {
       // Part A: a transient DB/Redis hiccup must never crash the process
       // with an unhandled promise rejection (Node 20+ default behavior).
-      this.expireStaleOffers().catch((error: unknown) => {
+      if (this.sweeping) return;
+      this.sweeping = true;
+      void this.expireStaleOffers().catch((error: unknown) => {
         this.logger.error(
           `Sweeper run failed: ${error instanceof Error ? error.message : String(error)}`,
         );
-      });
+      }).finally(() => { this.sweeping = false; });
     }, SWEEPER_INTERVAL_MS);
     this.intervalRef.unref?.();
   }
@@ -40,31 +45,18 @@ export class DispatchSweeperService implements OnModuleInit, OnModuleDestroy {
   }
 
   async expireStaleOffers(): Promise<{ expired: number; reWavedOrders: number }> {
-    const stale = await this.prisma.dispatchOffer.findMany({
-      where: { status: 'PENDING', expiresAt: { lte: new Date() } },
-      select: { id: true, orderId: true },
+    const now = new Date();
+    const expired = await this.prisma.dispatchOffer.updateMany({
+      where: { status: 'PENDING', expiresAt: { lte: now } },
+      data: { status: 'EXPIRED', respondedAt: now },
     });
-    if (stale.length === 0) return { expired: 0, reWavedOrders: 0 };
-
-    await this.prisma.dispatchOffer.updateMany({
-      where: { id: { in: stale.map((offer) => offer.id) } },
-      data: { status: 'EXPIRED' },
+    const searching = await this.prisma.serviceOrder.findMany({
+      where: { state: OrderState.SEARCHING_EXPERT, dispatchOffers: { none: { status: 'PENDING' } } },
+      orderBy: { updatedAt: 'asc' }, take: 100, select: { id: true },
     });
-
-    const orderIds = [...new Set(stale.map((offer) => offer.orderId))];
-    let reWavedOrders = 0;
-    for (const orderId of orderIds) {
-      const order = await this.prisma.serviceOrder.findUnique({ where: { id: orderId } });
-      if (!order || order.state !== OrderState.SEARCHING_EXPERT) continue;
-      const pending = await this.prisma.dispatchOffer.count({
-        where: { orderId, status: 'PENDING' },
-      });
-      if (pending === 0) {
-        await this.dispatchService.startSearch(orderId);
-        reWavedOrders += 1;
-      }
+    for (const order of searching) {
+      await this.dispatchService.onOrderSearching({ orderId: order.id });
     }
-    this.logger.log(`Sweeper: expired ${stale.length} offers, re-waved ${reWavedOrders} orders`);
-    return { expired: stale.length, reWavedOrders };
+    return { expired: expired.count, reWavedOrders: searching.length };
   }
 }

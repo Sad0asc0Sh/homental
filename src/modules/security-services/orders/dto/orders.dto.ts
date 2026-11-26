@@ -2,6 +2,7 @@ import { Type } from 'class-transformer';
 import {
   ArrayNotEmpty,
   IsArray,
+  IsBoolean,
   IsIn,
   IsInt,
   IsObject,
@@ -13,6 +14,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { SupplyMode, UrgencyLevel, ServiceKey } from '@prisma/client';
+import { SliderSelectionDto } from '../../pricing/dto/slider-selection.dto';
 
 export class CreateOrderItemDto {
   @IsIn(Object.values(ServiceKey))
@@ -27,7 +29,7 @@ export class CreateOrderItemDto {
   config?: Record<string, unknown>;
 }
 
-export class CreateOrderDto {
+export class CreateOrderDto extends SliderSelectionDto {
   @IsUUID()
   addressId!: string;
 
@@ -50,22 +52,21 @@ export class CreateOrderDto {
   items!: CreateOrderItemDto[];
 }
 
+export class SubmitOrderDto extends SliderSelectionDto {}
+
 export class AssignTechnicianDto {
   @IsUUID()
   technicianUserId!: string;
 }
 
-export class QuoteOrderDto {
-  /** Integer Toman (JSON has no BigInt — converted in the service). */
+export class InspectionScopeDto {
+  @IsBoolean()
+  matchesFrozenScope!: boolean;
+
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  finalQuoteAmount!: number;
-
-  @IsOptional()
-  @IsString()
-  @Length(0, 500)
-  quoteNoteFa?: string;
+  revision!: number;
 }
 
 export class CancelOrderDto {

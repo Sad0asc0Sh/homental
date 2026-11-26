@@ -2,14 +2,21 @@
 
 import type {
   Advisory,
+  BargainingSlider,
   CatalogResponse,
   CityDto,
+  ManagedInvoice,
   OrderResult,
   PricingResult,
   ServiceKey,
   SupplyMode,
   UrgencyLevel,
 } from './types';
+import type {
+  B2BSupplyInput, B2BSupplyOrder, CreateSellerOfferInput, CreateSupplierCaseInput, FulfillmentStatus,
+  ResolveSupplierCaseInput, SellerOfferView, SellerProfileView, SellerShipmentView, SupplierCase,
+  SupplyCatalog, SupplyProduct, UpdateSellerOfferInput,
+} from './partner-supply.types';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000/api/v1';
 
@@ -100,11 +107,26 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
   const sentAccessToken = tokens.access;
   if (sentAccessToken) headers['Authorization'] = `Bearer ${sentAccessToken}`;
 
+  // No request may hang forever — a stuck/unreachable backend surfaces as a
+  // clean Persian error in the UI instead of an infinite skeleton.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
   let response: Response;
   try {
-    response = await fetch(`${API_URL}${path}`, { ...init, headers, cache: 'no-store' });
+    response = await fetch(`${API_URL}${path}`, {
+      ...init,
+      headers,
+      cache: 'no-store',
+      signal: controller.signal,
+    });
   } catch {
-    throw new ApiError('ارتباط با سرور هومنتال برقرار نشد؛ اتصال اینترنت را بررسی کنید.', 0);
+    throw new ApiError(
+      'ارتباط با سرور هومنتال برقرار نشد. در محیط توسعه، اجرای بک‌اند روی پورت ۳۰۰۰ و مجاز بودن مبدأ صفحه در CORS_ORIGINS را بررسی کنید.',
+      0,
+    );
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   // Seamless rotation: one 401 → single-flight refresh (or reuse rotated token) → retry once.
@@ -142,6 +164,7 @@ export interface AdvisorEvaluatePayload {
   citySlug?: string;
   urgency?: UrgencyLevel;
   supplyMode?: SupplyMode;
+  sliderBps?: number;
 }
 
 export const api = {
@@ -200,33 +223,34 @@ export const api = {
     urgency: UrgencyLevel;
     supplyMode: SupplyMode;
     items: Array<{ serviceKey: string; supplyMode?: SupplyMode; config?: Record<string, unknown> }>;
+    sliderBps?: number;
   }) =>
     request<OrderResult>('/orders', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
 
-  orders: (params?: { page?: number; limit?: number }) => {
+  orders: <Row extends OrderHeader = OrderRow>(params?: { page?: number; limit?: number }) => {
     const query = new URLSearchParams();
     if (params?.page) query.set('page', String(params.page));
     if (params?.limit) query.set('limit', String(params.limit));
     const qs = query.toString();
-    return request<OrdersPage>(`/orders${qs ? `?${qs}` : ''}`);
+    return request<OrdersPage<Row>>(`/orders${qs ? `?${qs}` : ''}`);
   },
   order: (id: string) => request<OrderDetail>(`/orders/${id}`),
-  submitOrder: (id: string) =>
+  submitOrder: (id: string, sliderBps?: number) =>
     request<{ orderId: string; state: string }>(`/orders/${id}/submit`, {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify({ sliderBps }),
     }),
   branchQueue: (id: string) =>
     request<{ orderId: string; state: string }>(`/orders/${id}/branch-queue`, {
       method: 'POST',
       body: JSON.stringify({}),
     }),
-  assignTechnician: (id: string, technicianUserId: string) =>
-    request<{ orderId: string; state: string; technicianId: string }>(
-      `/orders/${id}/assign-technician`,
+  inviteTechnician: (id: string, technicianUserId: string) =>
+    request<{ orderId: string; offerId: string; expiresAt: string }>(
+      `/orders/${id}/invite-technician`,
       { method: 'POST', body: JSON.stringify({ technicianUserId }) },
     ),
   enRoute: (id: string) =>
@@ -239,10 +263,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
-  quote: (id: string, finalQuoteAmount: number) =>
-    request<{ orderId: string; finalQuoteAmount: number }>(`/orders/${id}/quote`, {
+  confirmInspectionScope: (id: string, revision: number) =>
+    request<{ orderId: string; state: string }>(`/orders/${id}/inspection-scope`, {
       method: 'POST',
-      body: JSON.stringify({ finalQuoteAmount }),
+      body: JSON.stringify({ matchesFrozenScope: true, revision }),
     }),
   approveQuote: (id: string) =>
     request<{ orderId: string; state: string }>(`/orders/${id}/approve-quote`, {
@@ -265,11 +289,24 @@ export const api = {
       body: JSON.stringify({ rating, commentFa }),
     }),
 
+  submitMeterReadings: (orderId: string, readings: MeterReadingInput[]) =>
+    request<TechnicianMeteredAdjustment>(`/orders/${orderId}/meter-readings`, {
+      method: 'POST', body: JSON.stringify({ readings }),
+    }),
+
+  approveMeteredAdjustment: (orderId: string, adjustmentId: string, idempotencyKey: string) =>
+    request<MeteredAdjustment>(`/orders/${orderId}/adjustments/${adjustmentId}/approve`, {
+      method: 'POST', body: JSON.stringify({ idempotencyKey }),
+    }),
+
+  rejectMeteredAdjustment: (orderId: string, adjustmentId: string) =>
+    request<MeteredAdjustment>(`/orders/${orderId}/adjustments/${adjustmentId}/reject`, { method: 'POST' }),
+
   // ── Handover gate (technician) ────────────────────────────────────────────
 
   registerHardwareUnits: (
     id: string,
-    units: Array<{ orderItemId: string; categoryFa: string; brand?: string; model?: string; serialNumber: string }>,
+    units: Array<{ orderItemId: string; orderAddonId?: string; categoryFa: string; brand?: string; model?: string; serialNumber: string }>,
   ) =>
     request<{ registered: number }>(`/orders/${id}/hardware-units`, {
       method: 'POST',
@@ -283,7 +320,7 @@ export const api = {
     ),
 
   completeHandover: (id: string, otp: string) =>
-    request<{ orderId: string; state: string; warranty: { policyNumber: string; coverageMonths: number } }>(
+    request<{ orderId: string; state: string; warrantyPolicyNumber: string; coverageMonths: number; guaranteedNetPayout: string }>(
       `/orders/${id}/complete-handover`,
       { method: 'POST', body: JSON.stringify({ otp }) },
     ),
@@ -299,11 +336,61 @@ export const api = {
   walletMe: (page = 1, limit = 20) =>
     request<WalletMe>(`/wallet/me?page=${page}&limit=${limit}`),
 
-  walletTopup: (amount: number, idempotencyKey: string) =>
+  walletTopup: (amount: number | string, idempotencyKey: string) =>
     request<Record<string, unknown>>('/wallet/topup', {
       method: 'POST',
       body: JSON.stringify({ amount, idempotencyKey }),
     }),
+
+  // ── Partner supply ────────────────────────────────────────────────────────
+
+  supplyCatalog: () => request<SupplyCatalog>('/partner-supply/catalog'),
+
+  supplyOrders: () => request<B2BSupplyOrder[]>('/partner-supply/orders'),
+
+  createSupplyOrder: (input: B2BSupplyInput) => request<B2BSupplyOrder>('/partner-supply/orders', {
+    method: 'POST', body: JSON.stringify(input),
+  }),
+
+  cancelSupplyOrder: (id: string) => request<B2BSupplyOrder>(`/partner-supply/orders/${id}/cancel`, { method: 'POST' }),
+
+  confirmSupplyDelivery: (id: string) => request<{ fulfillmentId: string; status: FulfillmentStatus }>(
+    `/partner-supply/fulfillments/${id}/confirm-delivery`, { method: 'POST' },
+  ),
+
+  supplierCases: () => request<SupplierCase[]>('/partner-supply/cases'),
+
+  createSupplierCase: (input: CreateSupplierCaseInput) => request<SupplierCase>('/partner-supply/cases', {
+    method: 'POST', body: JSON.stringify(input),
+  }),
+
+  resolveSupplierCase: (id: string, input: ResolveSupplierCaseInput) => request<SupplierCase>(
+    `/partner-supply/cases/${id}/resolve`, { method: 'POST', body: JSON.stringify(input) },
+  ),
+
+  messageSupplierCase: (id: string, textFa: string) => request<SupplierCase>(`/partner-supply/cases/${id}/messages`, {
+    method: 'POST', body: JSON.stringify({ textFa }),
+  }),
+
+  sellerProfile: () => request<SellerProfileView>('/seller/profile'),
+
+  sellerProducts: () => request<SupplyProduct[]>('/seller/products'),
+
+  sellerOffers: () => request<SellerOfferView[]>('/seller/offers'),
+
+  createSellerOffer: (input: CreateSellerOfferInput) => request<SellerOfferView>('/seller/offers', {
+    method: 'POST', body: JSON.stringify(input),
+  }),
+
+  updateSellerOffer: (id: string, input: UpdateSellerOfferInput) => request<SellerOfferView>(`/seller/offers/${id}`, {
+    method: 'PATCH', body: JSON.stringify(input),
+  }),
+
+  sellerFulfillments: () => request<SellerShipmentView[]>('/seller/fulfillments'),
+
+  dispatchSellerFulfillment: (id: string) => request<{ fulfillmentId: string; status: FulfillmentStatus }>(
+    `/seller/fulfillments/${id}/dispatch`, { method: 'PATCH' },
+  ),
 
   // ── Warranties & claims ───────────────────────────────────────────────────
 
@@ -347,6 +434,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+
+  dispatchOffers: () => request<DispatchOfferView[]>('/dispatch/offers'),
 
   acceptOffer: (offerId: string) =>
     request<{ orderId: string; state: string; offerId: string }>(
@@ -532,45 +621,111 @@ export interface EvaluateResponse {
   pricing?: PricingResult;
 }
 
-export interface OrdersPage {
-  items: OrderRow[];
+export interface OrdersPage<Row extends OrderHeader = OrderRow> {
+  items: Row[];
   total: number;
   page: number;
   limit: number;
 }
 
-export interface OrderRow {
+interface OrderHeader {
   id: string;
   orderNumber: string;
-  customerId: string;
-  technicianId: string | null;
-  branchId: string | null;
   state: string;
-  finalQuoteAmount: string | null;
-  pricing?: { netEstimated?: string; estimatedMin?: string; estimatedMax?: string } | null;
-  urgency?: string;
-  supplyMode?: SupplyMode;
-  cancelReason?: string | null;
-  completedAt?: string | null;
+  pricingVersion: number;
+  activeRevision: number;
+  supplyMode: SupplyMode;
   createdAt: string;
-  items?: Array<{
+}
+
+export interface OrderRow extends OrderHeader {
+  technicianId?: string | null;
+  finalQuoteAmount?: string | null;
+  pricing?: { netEstimated?: string; estimatedMin?: string; estimatedMax?: string };
+  invoice?: ManagedInvoice | null;
+  slider?: BargainingSlider | null;
+  latestAdjustment?: MeteredAdjustment | null;
+  pendingAdjustment?: MeteredAdjustment | null;
+  escrowStatus?: 'OPEN' | 'SETTLED' | 'REFUNDED' | null;
+  items: Array<{
     id: string;
-    supplyMode: SupplyMode | null;
-    config?: Record<string, unknown>;
-    serviceDefinition?: { key: ServiceKey; titleFa: string };
+    supplyMode: SupplyMode;
+    serviceDefinition: { key: ServiceKey; titleFa: string };
   }>;
-  serviceDefinition?: { key: ServiceKey; titleFa: string };
+}
+
+export interface BranchOrderRow extends OrderRow {
+  branchId: string | null;
+}
+
+export interface TechnicianOrderRow extends OrderHeader {
+  address: { titleFa: string; fullAddressFa: string } | null;
+  tasks: Array<{
+    orderItemId: string;
+    serviceKey: ServiceKey;
+    titleFa: string;
+    supplyMode: SupplyMode;
+    details: Array<{ labelFa: string; value: string | number | boolean }>;
+  }>;
+  agreedPackageNet: string | null;
+  meteredLabor: string;
+  materials: Array<{ id: string; titleFa: string; unit: 'EACH' | 'METER'; qty: number; quantityCm?: number | null }>;
+  meteredLines?: MeteredLine[];
+  latestAdjustment?: TechnicianMeteredAdjustment | null;
+  pendingAdjustment?: TechnicianMeteredAdjustment | null;
+  serialsRequired: Array<{
+    orderAddonId: string;
+    orderItemId: string | null;
+    titleFa: string;
+    qty: number;
+    registeredQty: number;
+  }>;
+}
+
+export interface MeteredLine {
+  lineKey: string;
+  titleFa: string;
+  estimatedCm: number;
+}
+
+export interface MeterReadingInput {
+  lineKey: string;
+  actualCm: number;
+  photoAssetId: string;
+}
+
+export interface MeteredAdjustment {
+  id: string;
+  status: 'PENDING_APPROVAL' | 'APPROVED' | 'AUTO_REFUNDED' | 'REJECTED';
+  baseRevision: number;
+  resultingRevision: number | null;
+  deltaAmount: string;
+  customerDecidedAt: string | null;
+  readings: Array<MeteredLine & MeterReadingInput>;
+}
+
+export type TechnicianMeteredAdjustment = Omit<MeteredAdjustment, 'deltaAmount'>;
+
+export interface DispatchOfferView {
+  offerId: string;
+  orderId: string;
+  orderNumber: string;
+  score: number;
+  expiresAt: string;
+  expiresInMs: number;
+  isBranchInvite: boolean;
+  guaranteedPackageNet: string | null;
 }
 
 export interface OrderDetail extends OrderRow {
-  stateTransitions: Array<{
+  stateTransitions?: Array<{
     id: string;
     fromState: string | null;
     toState: string;
     reason: string | null;
     createdAt: string;
   }>;
-  review: { id: string; rating: number; commentFa: string | null } | null;
+  review?: { id: string; rating: number; commentFa: string | null } | null;
 }
 
 export interface WalletMe {
@@ -677,6 +832,8 @@ export interface AdminBranchFinanceRow {
 
 export interface AdminFinanceSummary {
   platformBalance: string;
+  restrictedReserve: string;
+  restrictedFulfillment: string;
   totalPlatformCommission: string;
   totalWarrantyReserve: string;
   totalTechnicianPayout: string;

@@ -17,6 +17,7 @@ export class PricingController {
       lng: dto.lng,
       urgency: dto.urgency,
       supplyMode: dto.supplyMode,
+      sliderBps: dto.sliderBps,
       items: dto.items,
     });
   }

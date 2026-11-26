@@ -34,6 +34,11 @@ export class DispatchController {
     return this.dispatchService.acceptOffer(actor, offerId);
   }
 
+  @Get('offers')
+  listOffers(@CurrentUser() actor: AuthenticatedUser) {
+    return this.dispatchService.listMyOffers(actor);
+  }
+
   @Post('offers/:offerId/decline')
   async declineOffer(@CurrentUser() actor: AuthenticatedUser, @Param('offerId', ParseUUIDPipe) offerId: string) {
     return this.dispatchService.declineOffer(actor, offerId);

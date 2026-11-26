@@ -71,6 +71,7 @@ export interface EvaluatePricingOptions {
   lng?: number;
   urgency?: string;
   supplyMode?: string;
+  sliderBps?: number;
 }
 
 export interface EvaluateAdvisoryResult {

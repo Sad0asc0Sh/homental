@@ -12,6 +12,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { SupplyMode, UrgencyLevel, ServiceKey } from '@prisma/client';
+import { SliderSelectionDto } from './slider-selection.dto';
 
 export class EstimateItemDto {
   @IsIn(Object.values(ServiceKey))
@@ -26,7 +27,7 @@ export class EstimateItemDto {
   config?: Record<string, unknown>;
 }
 
-export class EstimateDto {
+export class EstimateDto extends SliderSelectionDto {
   @IsOptional()
   @IsString()
   citySlug?: string;

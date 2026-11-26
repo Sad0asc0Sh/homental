@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { SupplyMode } from '@prisma/client';
 import { JsonLogicEvaluator } from '../shared/json-logic.evaluator';
+import { MAX_QUANTITY_CM, meteredStockQty } from './metered-quantity';
 
 export interface HardwareLine {
   ref: string;
@@ -42,9 +43,11 @@ interface LineItemLike {
   ref?: string;
   labelFa?: string;
   qty?: unknown;
+  quantityCm?: unknown;
   unitPrice?: number;
   unitPriceByOption?: { variable: string; options: Record<string, number> };
   unitPriceLogic?: unknown;
+  skuLogic?: unknown;
 }
 
 interface LaborSchemaLike {
@@ -60,6 +63,10 @@ interface PricingSchemaLike {
   dispatch?: { base?: { labelFa?: string; amount?: number } };
   multipliersApplyTo?: unknown;
   range?: { minAdjustPct?: number; maxAdjustPct?: number };
+  managedWork?: {
+    additionalMinutes?: unknown;
+    meteredLabor?: { titleFa: string; qty?: unknown; quantityCm?: unknown };
+  };
 }
 
 const DYNAMIC_FACTOR_TARGETS = new Set(['labor', 'dispatch']);
@@ -73,6 +80,45 @@ const DYNAMIC_FACTOR_TARGETS = new Set(['labor', 'dispatch']);
 @Injectable()
 export class PricingSchemaInterpreter {
   constructor(private readonly evaluator: JsonLogicEvaluator) {}
+
+  interpretManagedScope(params: {
+    serviceKey: string;
+    pricingSchema: unknown;
+    config: Record<string, unknown>;
+    supplyMode: SupplyMode;
+  }) {
+    const schema = (params.pricingSchema ?? {}) as PricingSchemaLike;
+    this.assertHardwareNeverSurged(schema);
+    const vars = { ...(schema.variables ?? {}), ...params.config };
+    const hardware = params.supplyMode === SupplyMode.INSTALL_ONLY
+      ? []
+      : (schema.hardware?.lineItems ?? []).flatMap((line) => {
+          const quantityCm = line.quantityCm === undefined ? undefined : this.resolveQty(line.quantityCm, vars);
+          const qty = quantityCm === undefined ? this.resolveQty(line.qty, vars) : meteredStockQty(quantityCm);
+          if (qty === 0) return [];
+          const sku = line.skuLogic === undefined
+            ? `${params.serviceKey}-${line.ref}`
+            : this.evaluator.evaluateString(line.skuLogic, vars);
+          return [{ ref: line.ref, sku, qty, quantityCm }];
+        });
+    const complexityRates = (schema.labor?.complexity ?? [])
+      .filter((rule) => rule.when === undefined || this.evaluator.evaluateBoolean(rule.when, vars))
+      .map((rule) => rule.multiplier ?? 1);
+    const work = schema.managedWork;
+    return {
+      hardware,
+      complexityRates,
+      technicianTravel: BigInt(schema.dispatch?.base?.amount ?? 0),
+      additionalMinutes: work?.additionalMinutes === undefined
+        ? 0 : this.resolveQty(work.additionalMinutes, vars),
+      meteredLabor: work?.meteredLabor && {
+        titleFa: work.meteredLabor.titleFa,
+        quantityCm: work.meteredLabor.quantityCm === undefined
+          ? this.resolveQty({ '*': [work.meteredLabor.qty, 100] }, vars)
+          : this.resolveQty(work.meteredLabor.quantityCm, vars),
+      },
+    };
+  }
 
   interpret(params: {
     serviceKey: string;
@@ -149,7 +195,11 @@ export class PricingSchemaInterpreter {
   /** Double-guard: JSON-Logic result AND the final value are clamped ≥ 0. */
   private resolveQty(qty: unknown, vars: Record<string, unknown>): number {
     const raw = typeof qty === 'number' ? qty : this.evaluator.evaluateNumber(qty as never, vars);
-    return Math.max(0, Math.round(raw));
+    const quantity = Math.max(0, Math.round(raw));
+    if (!Number.isSafeInteger(quantity) || quantity > MAX_QUANTITY_CM) {
+      throw new BadRequestException('تعداد یا اندازه واردشده از محدوده مجاز بیشتر است.');
+    }
+    return quantity;
   }
 
   private resolveUnitPrice(item: LineItemLike, vars: Record<string, unknown>): number {

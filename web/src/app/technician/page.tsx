@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   BadgeCheck,
   Loader2,
@@ -14,9 +14,10 @@ import {
   X,
 } from 'lucide-react';
 import { AuthModal } from '@/components/brief/AuthModal';
-import { StateBadge, STATE_LABELS } from '@/components/orders/order-state';
-import { api, ApiError, type OrderRow, type TechnicianMe } from '@/lib/api';
-import { formatToman, toLatinDigits, toPersianDigits } from '@/lib/format';
+import { MeterReadingsForm } from '@/components/orders/MeterReadingsForm';
+import { StateBadge } from '@/components/orders/order-state';
+import { api, ApiError, type DispatchOfferView, type TechnicianMe, type TechnicianOrderRow } from '@/lib/api';
+import { formatMeters, formatToman, toLatinDigits, toPersianDigits } from '@/lib/format';
 import {
   parseNotificationPayload,
   useDispatchSocket,
@@ -30,12 +31,7 @@ const MASHHAD_PRESETS = [
   { nameFa: 'سجاد', lat: 36.3018, lng: 59.5838 },
 ];
 
-interface LiveOffer {
-  offerId: string;
-  orderId: string;
-  orderNumber: string;
-  score: number;
-  expiresInMs: number;
+interface LiveOffer extends DispatchOfferView {
   receivedAt: number;
 }
 
@@ -43,6 +39,26 @@ interface SerialDraft {
   serialNumber: string;
   brand: string;
   model: string;
+}
+
+interface PendingSerial {
+  key: string;
+  orderItemId: string;
+  orderAddonId?: string;
+  categoryFa: string;
+  titleFa: string;
+}
+
+const EMPTY_SERIAL: SerialDraft = { serialNumber: '', brand: '', model: '' };
+const MANAGED_PRICING_VERSION = 2;
+
+function PackageNet({ amount }: { amount: string | null }) {
+  return amount !== null ? (
+    <div className="flex flex-wrap justify-between gap-1 rounded-xl bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-800">
+      <span>دریافتی تضمین‌شده بسته اجرا</span>
+      <span className="tabular-fa">{formatToman(amount, 'full')}</span>
+    </div>
+  ) : null;
 }
 
 function CountdownBar({
@@ -63,7 +79,7 @@ function CountdownBar({
 
   const remaining = Math.max(0, ttlMs - (now - receivedAt));
   const seconds = Math.ceil(remaining / 1000);
-  const percent = Math.max(0, (remaining / ttlMs) * 100);
+  const percent = ttlMs > 0 ? Math.min(100, (remaining / ttlMs) * 100) : 0;
 
   useEffect(() => {
     if (remaining <= 0) onExpire();
@@ -111,14 +127,16 @@ export default function TechnicianPage() {
   const [statusBusy, setStatusBusy] = useState(false);
   const [coords, setCoords] = useState<{ lat: number; lng: number }>(MASHHAD_PRESETS[0]);
   const [offers, setOffers] = useState<LiveOffer[]>([]);
-  const [orders, setOrders] = useState<OrderRow[] | null>(null);
+  const offersRequest = useRef(0);
+  const ordersRequest = useRef(0);
+  const [orders, setOrders] = useState<TechnicianOrderRow[] | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [quoteDrafts, setQuoteDrafts] = useState<Record<string, string>>({});
+  const [offerBusyId, setOfferBusyId] = useState<string | null>(null);
   const [otpDrafts, setOtpDrafts] = useState<Record<string, string>>({});
   const [serialDrafts, setSerialDrafts] = useState<Record<string, Record<string, SerialDraft>>>({});
-  const [registeredSerialOrders, setRegisteredSerialOrders] = useState<Record<string, boolean>>({});
+  const [registeredLegacyOrders, setRegisteredLegacyOrders] = useState<Record<string, boolean>>({});
   const [checklist, setChecklist] = useState<Record<string, { passwords: boolean; access: boolean }>>({});
   const [devOtp, setDevOtp] = useState<Record<string, string>>({});
   const [resendUnlockAt, setResendUnlockAt] = useState<Record<string, number>>({});
@@ -134,15 +152,29 @@ export default function TechnicianPage() {
 
   const reloadOrders = useCallback(() => {
     if (!accessToken || user?.role !== 'TECHNICIAN') return;
+    const request = ++ordersRequest.current;
     setRefreshing(true);
-    api.orders()
-      .then((page) => setOrders(page.items))
-      .catch(() => setOrders([]))
-      .finally(() => setRefreshing(false));
+    api.orders<TechnicianOrderRow>()
+      .then((page) => { if (request === ordersRequest.current) setOrders(page.items); })
+      .catch(() => { if (request === ordersRequest.current) setOrders([]); })
+      .finally(() => { if (request === ordersRequest.current) setRefreshing(false); });
+  }, [accessToken, user?.role]);
+
+  const reloadOffers = useCallback(() => {
+    if (!accessToken || user?.role !== 'TECHNICIAN') return;
+    const request = ++offersRequest.current;
+    void api.dispatchOffers().then((rows) => {
+      if (request === offersRequest.current) {
+        const receivedAt = Date.now();
+        setOffers(rows.map((offer) => ({ ...offer, receivedAt })));
+      }
+    }).catch(() => undefined);
   }, [accessToken, user?.role]);
 
   useEffect(() => {
     if (!accessToken || user?.role !== 'TECHNICIAN') {
+      offersRequest.current++;
+      ordersRequest.current++;
       setOrders(null);
       setOffers([]);
       setIsOnline(false);
@@ -150,6 +182,7 @@ export default function TechnicianPage() {
       return;
     }
     reloadOrders();
+    reloadOffers();
     api.dispatchMe()
       .then((me) => {
         setTechStats(me);
@@ -160,7 +193,7 @@ export default function TechnicianPage() {
         }
       })
       .catch(() => undefined);
-  }, [accessToken, user?.role, reloadOrders]);
+  }, [accessToken, user?.role, reloadOrders, reloadOffers]);
 
   const runAction = useCallback(
     async (orderId: string, action: () => Promise<unknown>) => {
@@ -168,7 +201,6 @@ export default function TechnicianPage() {
       setActionError((prev) => ({ ...prev, [orderId]: '' }));
       try {
         await action();
-        reloadOrders();
       } catch (error) {
         if (error instanceof ApiError && error.statusCode === 429) {
           const retryAfter = Number(error.payload?.retryAfterSeconds ?? 60);
@@ -179,6 +211,7 @@ export default function TechnicianPage() {
           [orderId]: error instanceof ApiError ? error.message : 'خطا در انجام عملیات.',
         }));
       } finally {
+        reloadOrders();
         setBusyId(null);
       }
     },
@@ -198,7 +231,7 @@ export default function TechnicianPage() {
       });
       setIsOnline(result.isOnline);
       setIsAcceptingOffers(result.isAcceptingOffers);
-      if (!result.isOnline) setOffers([]);
+      reloadOffers();
       setToast(result.isOnline ? 'وضعیت شما آنلاین شد' : 'وضعیت شما آفلاین شد');
     } catch (error) {
       setToast(error instanceof ApiError ? error.message : 'خطا در تغییر وضعیت.');
@@ -219,6 +252,7 @@ export default function TechnicianPage() {
         lng: coords.lng,
       });
       setIsAcceptingOffers(result.isAcceptingOffers);
+      reloadOffers();
     } catch (error) {
       setToast(error instanceof ApiError ? error.message : 'خطا در تغییر وضعیت دریافت پیشنهاد.');
     } finally {
@@ -256,28 +290,17 @@ export default function TechnicianPage() {
     return () => window.clearInterval(intervalId);
   }, [isOnline, coords.lat, coords.lng, accessToken, user?.role]);
 
-  // Socket live offers & order updates
-  const onDispatchOffer = useCallback(
-    (payload: DispatchEventPayloads['DISPATCH_OFFER']) => {
-      setOffers((prev) =>
-        prev.some((offer) => offer.offerId === payload.offerId)
-          ? prev
-          : [...prev, { ...payload, receivedAt: Date.now() }],
-      );
-      reloadOrders();
-    },
-    [reloadOrders],
-  );
-
   const onOfferTaken = useCallback((payload: DispatchEventPayloads['OFFER_TAKEN']) => {
     setOffers((prev) => prev.filter((offer) => offer.orderId !== payload.orderId));
     setToast('سفارش توسط کارشناس دیگری پذیرفته شد');
-  }, []);
+    reloadOffers();
+  }, [reloadOffers]);
 
   const { connected } = useDispatchSocket(user?.role === 'TECHNICIAN' ? accessToken : null, {
-    DISPATCH_OFFER: onDispatchOffer,
+    DISPATCH_OFFER: reloadOffers,
     OFFER_TAKEN: onOfferTaken,
     EXPERT_ASSIGNED: () => reloadOrders(),
+    METERED_ADJUSTMENT_CHANGED: () => reloadOrders(),
     notification: ({ raw }) => {
       const parsed = parseNotificationPayload(raw);
       if (parsed?.titleFa) {
@@ -287,21 +310,39 @@ export default function TechnicianPage() {
     },
   });
 
+  useEffect(() => {
+    if (connected) {
+      reloadOffers();
+      reloadOrders();
+    }
+  }, [connected, reloadOffers, reloadOrders]);
+
   const acceptOffer = async (offer: LiveOffer) => {
+    setOfferBusyId(offer.offerId);
     try {
       await api.acceptOffer(offer.offerId);
-      setOffers((prev) => prev.filter((o) => o.orderId !== offer.orderId && o.offerId !== offer.offerId));
+      setOffers((prev) => prev.filter((o) => o.orderId !== offer.orderId));
       setToast(`سفارش ${offer.orderNumber} به شما اختصاص یافت!`);
       reloadOrders();
     } catch (error) {
-      setOffers((prev) => prev.filter((o) => o.offerId !== offer.orderId && o.offerId !== offer.offerId));
       setToast(error instanceof ApiError ? error.message : 'خطا در پذیرش سفارش.');
+    } finally {
+      reloadOffers();
+      setOfferBusyId(null);
     }
   };
 
   const declineOffer = async (offer: LiveOffer) => {
-    await api.declineOffer(offer.offerId).catch(() => undefined);
-    setOffers((prev) => prev.filter((o) => o.offerId !== offer.offerId));
+    setOfferBusyId(offer.offerId);
+    try {
+      await api.declineOffer(offer.offerId);
+      setOffers((prev) => prev.filter((o) => o.offerId !== offer.offerId));
+    } catch (error) {
+      setToast(error instanceof ApiError ? error.message : 'خطا در رد پیشنهاد.');
+    } finally {
+      reloadOffers();
+      setOfferBusyId(null);
+    }
   };
 
   const expireOffer = useCallback((offerId: string) => {
@@ -322,7 +363,7 @@ export default function TechnicianPage() {
   ) => {
     setSerialDrafts((prev) => {
       const currentOrder = prev[orderId] ?? {};
-      const currentItem = currentOrder[itemId] ?? { serialNumber: '', brand: '', model: '' };
+      const currentItem = currentOrder[itemId] ?? EMPTY_SERIAL;
       return {
         ...prev,
         [orderId]: {
@@ -383,7 +424,7 @@ export default function TechnicianPage() {
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={reloadOrders}
+            onClick={() => { reloadOrders(); reloadOffers(); }}
             disabled={refreshing}
             className="btn-ghost !px-3 !py-1.5 text-xs"
           >
@@ -503,30 +544,39 @@ export default function TechnicianPage() {
               <div className="mb-2 flex items-center justify-between">
                 <p className="flex items-center gap-2 font-extrabold text-slate-800">
                   {offer.orderNumber}
-                  <span className="chip bg-emerald-50 text-[11px] text-emerald-700">
-                    <BadgeCheck size={12} />
-                    امتیاز {toPersianDigits(offer.score)}
-                  </span>
+                  {offer.isBranchInvite ? (
+                    <span className="chip bg-purple-50 text-[11px] text-purple-700">دعوت‌نامه شعبه</span>
+                  ) : (
+                    <span className="chip bg-emerald-50 text-[11px] text-emerald-700">
+                      <BadgeCheck size={12} />
+                      امتیاز {toPersianDigits(offer.score)}
+                    </span>
+                  )}
                 </p>
-                <button type="button" onClick={() => void declineOffer(offer)} aria-label="رد کردن">
+                <button type="button" disabled={offerBusyId !== null} onClick={() => void declineOffer(offer)} aria-label="رد کردن">
                   <X size={16} className="text-slate-400" />
                 </button>
               </div>
-              <CountdownBar
-                receivedAt={offer.receivedAt}
-                ttlMs={offer.expiresInMs}
-                onExpire={() => expireOffer(offer.offerId)}
-              />
+              <div className="space-y-2">
+                <PackageNet amount={offer.guaranteedPackageNet} />
+                <CountdownBar
+                  receivedAt={offer.receivedAt}
+                  ttlMs={offer.expiresInMs}
+                  onExpire={() => expireOffer(offer.offerId)}
+                />
+              </div>
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <button
                   type="button"
+                  disabled={offerBusyId !== null}
                   onClick={() => void acceptOffer(offer)}
                   className="rounded-xl bg-emerald-600 py-2.5 text-sm font-extrabold text-white hover:bg-emerald-700"
                 >
-                  پذیرش سفارش
+                  {offerBusyId === offer.offerId ? 'در حال بررسی…' : 'پذیرش سفارش'}
                 </button>
                 <button
                   type="button"
+                  disabled={offerBusyId !== null}
                   onClick={() => void declineOffer(offer)}
                   className="rounded-xl border border-slate-200 py-2.5 text-sm font-bold text-slate-600 hover:bg-slate-50"
                 >
@@ -549,14 +599,37 @@ export default function TechnicianPage() {
         {activeOrders.map((order) => {
           const busy = busyId === order.id;
           const err = actionError[order.id];
-          const quoteNum = Number(toLatinDigits(quoteDrafts[order.id] ?? '').replace(/\D/g, '') || '0');
-          const fullPackageItems = (order.items ?? []).filter(
-            (item) => (item.supplyMode ?? order.supplyMode ?? 'FULL_PACKAGE') === 'FULL_PACKAGE',
-          );
-          const serialsValid = fullPackageItems.every(
-            (item) => (serialDrafts[order.id]?.[item.id]?.serialNumber ?? '').trim().length >= 4,
+          const isManaged = order.pricingVersion === MANAGED_PRICING_VERSION;
+          const pendingSerials: PendingSerial[] = isManaged ? order.serialsRequired.flatMap((line) => {
+            const { orderItemId } = line;
+            if (!orderItemId) return [];
+            return Array.from({ length: Math.max(0, line.qty - line.registeredQty) }, (_, index) => {
+              const unit = line.registeredQty + index + 1;
+              return {
+                key: `${line.orderAddonId}:${unit}`,
+                orderItemId,
+                orderAddonId: line.orderAddonId,
+                categoryFa: line.titleFa,
+                titleFa: line.qty > 1 ? `${line.titleFa} — دستگاه ${toPersianDigits(unit)}` : line.titleFa,
+              };
+            });
+          }) : order.tasks.flatMap((task) => task.supplyMode === 'FULL_PACKAGE' && !registeredLegacyOrders[order.id] ? [{
+            key: task.orderItemId,
+            orderItemId: task.orderItemId,
+            categoryFa: task.titleFa,
+            titleFa: task.titleFa,
+          }] : []);
+          const serialsValid = pendingSerials.every(({ key }) =>
+            (serialDrafts[order.id]?.[key]?.serialNumber ?? '').trim().length >= 4,
           );
           const checklistReady = Boolean(checklist[order.id]?.passwords && checklist[order.id]?.access);
+          const meteredLines = order.meteredLines ?? [];
+          const latest = order.latestAdjustment ?? null;
+          const pending = order.pendingAdjustment ?? null;
+          const meterReady = !pending && (meteredLines.length === 0 || (
+            (latest?.status === 'APPROVED' || latest?.status === 'AUTO_REFUNDED') &&
+            latest.resultingRevision === order.activeRevision
+          ));
           const otpClean = toLatinDigits(otpDrafts[order.id] ?? '').replace(/\D/g, '');
           const cooldownRemaining = Math.max(
             0,
@@ -569,6 +642,28 @@ export default function TechnicianPage() {
                 <p className="font-extrabold text-slate-800">{order.orderNumber}</p>
                 <StateBadge state={order.state} />
               </header>
+              <PackageNet amount={order.agreedPackageNet} />
+              {order.address ? (
+                <p className="flex items-start gap-2 text-xs text-slate-600">
+                  <MapPin size={14} className="shrink-0 text-primary-700" />
+                  {order.address.fullAddressFa}
+                </p>
+              ) : null}
+              {order.tasks.length ? (
+                <ul className="flex flex-wrap gap-1.5 text-xs text-slate-600" aria-label="خدمات سفارش">
+                  {order.tasks.map((task) => <li key={task.orderItemId} className="chip bg-slate-50">{task.titleFa}</li>)}
+                </ul>
+              ) : null}
+              {order.state === 'INSPECTING' && order.materials.length > 0 ? (
+                <details className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+                  <summary className="cursor-pointer font-bold text-slate-700">تجهیزات توافق‌شده</summary>
+                  <ul className="mt-2 space-y-1">
+                    {order.materials.map(({ id, titleFa, unit, qty, quantityCm }) => (
+                      <li key={id}>{titleFa}، {quantityCm != null ? formatMeters(quantityCm) : `${toPersianDigits(qty)} ${unit === 'METER' ? 'متر' : 'عدد'}`}</li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
               {err ? <p className="rounded-xl bg-red-50 p-2.5 text-xs font-bold text-red-600">{err}</p> : null}
 
               {order.state === 'EXPERT_ASSIGNED' ? (
@@ -593,54 +688,21 @@ export default function TechnicianPage() {
                 </button>
               ) : null}
 
-              {order.state === 'INSPECTING' ? (
-                <div className="space-y-2">
-                  {order.finalQuoteAmount ? (
-                    <p className="rounded-xl bg-sky-50 p-3 text-xs font-bold text-sky-800">
-                      پیش‌فاکتور به مبلغ {formatToman(order.finalQuoteAmount, 'full')} ثبت شد — در
-                      انتظار تأیید و پرداخت امن (اسکرو) توسط مشتری.
-                    </p>
-                  ) : null}
-                  <input
-                    dir="ltr"
-                    type="text"
-                    inputMode="numeric"
-                    value={quoteDrafts[order.id] ?? ''}
-                    onChange={(event) =>
-                      setQuoteDrafts((prev) => ({
-                        ...prev,
-                        [order.id]: toLatinDigits(event.target.value).replace(/\D/g, ''),
-                      }))
-                    }
-                    placeholder="مبلغ پیش‌فاکتور نهایی (تومان)"
-                    className="tabular-fa w-full rounded-xl border border-slate-200 px-4 py-2.5 text-left font-bold focus:border-primary-400 focus:outline-none"
-                  />
-                  {quoteNum > 0 ? (
-                    <p className="text-left text-xs font-bold text-primary-700">
-                      {formatToman(quoteNum, 'full')}
-                    </p>
-                  ) : null}
-                  <button
-                    type="button"
-                    disabled={busy || quoteNum <= 0}
-                    onClick={() => runAction(order.id, () => api.quote(order.id, quoteNum))}
-                    className="btn-primary w-full"
-                  >
-                    {busy ? (
-                      <Loader2 size={15} className="animate-spin" />
-                    ) : order.finalQuoteAmount ? (
-                      'ویرایش پیش‌فاکتور نهایی'
-                    ) : (
-                      'ثبت پیش‌فاکتور نهایی'
-                    )}
-                  </button>
-                </div>
+              {order.state === 'INSPECTING' && isManaged ? (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => runAction(order.id, () => api.confirmInspectionScope(order.id, order.activeRevision))}
+                  className="btn-primary w-full"
+                >
+                  {busy ? <Loader2 size={15} className="animate-spin" /> : 'تأیید تطابق محل و شروع کار'}
+                </button>
               ) : null}
 
               {order.state === 'QUOTE_APPROVED' ? (
                 <div className="space-y-3">
                   <p className="rounded-xl bg-indigo-50 p-3 text-xs font-bold text-indigo-700">
-                    مشتری پیش‌فاکتور را تأیید و مبلغ در اسکرو مسدود شد.
+                    {isManaged ? 'تطابق محل تأیید شده و سفارش آماده اجراست.' : 'مشتری پیش‌فاکتور را تأیید و مبلغ در اسکرو مسدود شد.'}
                   </p>
                   <button
                     type="button"
@@ -655,66 +717,62 @@ export default function TechnicianPage() {
 
               {order.state === 'IN_PROGRESS' ? (
                 <div className="space-y-3">
-                  {/* Serial registration per FULL_PACKAGE item */}
-                  <p className="text-xs font-bold text-slate-700">ثبت شماره سریال تجهیزات:</p>
-                  {(order.items ?? []).map((item) => {
-                    const effective = item.supplyMode ?? order.supplyMode ?? 'FULL_PACKAGE';
-                    if (effective === 'INSTALL_ONLY') {
-                      return (
-                        <div
-                          key={item.id}
-                          className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2 text-[11px] text-slate-600"
-                        >
-                          <span className="font-bold">{item.serviceDefinition?.titleFa}</span>
-                          <span className="chip bg-white text-[10px] font-bold text-slate-500">
-                            کالای مشتری — معاف از ثبت سریال
-                          </span>
-                        </div>
-                      );
-                    }
-                    const draft = serialDrafts[order.id]?.[item.id] ?? {
-                      serialNumber: '',
-                      brand: '',
-                      model: '',
-                    };
-                    return (
-                      <div key={item.id} className="space-y-2 rounded-lg border border-slate-200 p-3">
-                        <div className="flex items-center justify-between">
-                          <p className="text-xs font-bold text-slate-700">
-                            {item.serviceDefinition?.titleFa}
-                          </p>
-                          <span className="text-[10px] text-slate-400">حداقل ۴ کاراکتر</span>
-                        </div>
-                        <input
-                          dir="ltr"
-                          value={draft.serialNumber}
-                          onChange={(event) =>
-                            updateSerialField(order.id, item.id, 'serialNumber', event.target.value)
-                          }
-                          placeholder="شماره سریال دستگاه (الزامی)"
-                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-left text-xs focus:border-primary-400 focus:outline-none"
-                        />
-                        <div className="grid grid-cols-2 gap-2">
-                          <input
-                            value={draft.brand}
-                            onChange={(event) =>
-                              updateSerialField(order.id, item.id, 'brand', event.target.value)
-                            }
-                            placeholder="برند (اختیاری)"
-                            className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs focus:border-primary-400 focus:outline-none"
-                          />
-                          <input
-                            value={draft.model}
-                            onChange={(event) =>
-                              updateSerialField(order.id, item.id, 'model', event.target.value)
-                            }
-                            placeholder="مدل (اختیاری)"
-                            className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs focus:border-primary-400 focus:outline-none"
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
+                  <MeterReadingsForm
+                    key={`${order.activeRevision}:${latest?.id ?? ''}`}
+                    orderId={order.id}
+                    lines={meteredLines}
+                    latest={latest}
+                    pending={pending}
+                    reconciled={meterReady}
+                    busy={busy}
+                    runAction={(action) => { void runAction(order.id, action); }}
+                  />
+                  {pendingSerials.length > 0 ? (
+                    <div className="space-y-2">
+                      <p className="text-xs font-bold text-slate-700">ثبت شماره سریال تجهیزات</p>
+                      {pendingSerials.map(({ key, titleFa }) => {
+                        const draft = serialDrafts[order.id]?.[key] ?? EMPTY_SERIAL;
+                        return (
+                          <fieldset key={key} className="space-y-2 rounded-lg border border-slate-200 p-3">
+                            <legend className="px-1 text-xs font-bold text-slate-700">{titleFa}</legend>
+                            <input
+                              dir="ltr"
+                              aria-label={`شماره سریال ${titleFa}`}
+                              value={draft.serialNumber}
+                              maxLength={80}
+                              onChange={(event) =>
+                                updateSerialField(order.id, key, 'serialNumber', event.target.value)
+                              }
+                              placeholder="شماره سریال دستگاه (حداقل ۴ کاراکتر)"
+                              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-left text-xs focus:border-primary-400 focus:outline-none"
+                            />
+                            <div className="grid grid-cols-2 gap-2">
+                              <input
+                                aria-label={`برند ${titleFa}`}
+                                value={draft.brand}
+                                maxLength={60}
+                                onChange={(event) =>
+                                  updateSerialField(order.id, key, 'brand', event.target.value)
+                                }
+                                placeholder="برند (اختیاری)"
+                                className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs focus:border-primary-400 focus:outline-none"
+                              />
+                              <input
+                                aria-label={`مدل ${titleFa}`}
+                                value={draft.model}
+                                maxLength={60}
+                                onChange={(event) =>
+                                  updateSerialField(order.id, key, 'model', event.target.value)
+                                }
+                                placeholder="مدل (اختیاری)"
+                                className="w-full rounded-lg border border-slate-200 px-3 py-1.5 text-xs focus:border-primary-400 focus:outline-none"
+                              />
+                            </div>
+                          </fieldset>
+                        );
+                      })}
+                    </div>
+                  ) : null}
 
                   {/* Mandatory privacy checklist */}
                   <div className="space-y-2 rounded-xl bg-amber-50 p-3">
@@ -757,24 +815,32 @@ export default function TechnicianPage() {
 
                   <button
                     type="button"
-                    disabled={busy || !checklistReady || !serialsValid}
+                    disabled={busy || !checklistReady || !serialsValid || !meterReady}
                     onClick={() =>
                       runAction(order.id, async () => {
-                        if (fullPackageItems.length > 0 && !registeredSerialOrders[order.id]) {
+                        if (pendingSerials.length > 0) {
                           await api.registerHardwareUnits(
                             order.id,
-                            fullPackageItems.map((item) => {
-                              const draft = serialDrafts[order.id]?.[item.id];
+                            pendingSerials.map(({ key, orderItemId, orderAddonId, categoryFa }) => {
+                              const draft = serialDrafts[order.id]?.[key] ?? EMPTY_SERIAL;
                               return {
-                                orderItemId: item.id,
-                                categoryFa: item.serviceDefinition?.titleFa ?? 'تجهیزات',
-                                serialNumber: (draft?.serialNumber ?? '').trim(),
-                                brand: draft?.brand.trim() || undefined,
-                                model: draft?.model.trim() || undefined,
+                                orderItemId,
+                                orderAddonId,
+                                categoryFa,
+                                serialNumber: draft.serialNumber.trim(),
+                                brand: draft.brand.trim() || undefined,
+                                model: draft.model.trim() || undefined,
                               };
                             }),
                           );
-                          setRegisteredSerialOrders((prev) => ({ ...prev, [order.id]: true }));
+                          if (isManaged) {
+                            setOrders((prev) => prev?.map((row) => row.id === order.id ? {
+                              ...row,
+                              serialsRequired: row.serialsRequired.map((line) => ({ ...line, registeredQty: line.qty })),
+                            } : row) ?? null);
+                          } else {
+                            setRegisteredLegacyOrders((prev) => ({ ...prev, [order.id]: true }));
+                          }
                         }
                         const result = await api.requestHandover(
                           order.id,
@@ -837,7 +903,7 @@ export default function TechnicianPage() {
                       runAction(order.id, async () => {
                         const completed = await api.completeHandover(order.id, otpClean);
                         setToast(
-                          `سفارش تکمیل و گارانتی ${completed.warranty.policyNumber} فعال شد`,
+                          `سفارش تکمیل و گارانتی ${completed.warrantyPolicyNumber} فعال شد`,
                         );
                       })
                     }
@@ -866,10 +932,6 @@ export default function TechnicianPage() {
                 </div>
               ) : null}
 
-              <p className="text-[10px] text-slate-400">
-                وضعیت: {STATE_LABELS[order.state]?.labelFa ?? order.state}
-                {order.finalQuoteAmount ? ` — پیش‌فاکتور: ${formatToman(order.finalQuoteAmount, 'full')}` : ''}
-              </p>
             </section>
           );
         })}

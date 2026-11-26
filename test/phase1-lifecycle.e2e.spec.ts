@@ -1,16 +1,11 @@
 /**
- * PHASE 1 END-TO-END LIFECYCLE (final gate)
- * =====================================================================
- * Runs the entire Homental flow over one shared in-memory Prisma + Redis:
- *   Catalog → Advisory → Pricing → Create Order → Submit (auto-dispatch)
- *   → Dispatch Accept (atomic lock; loser cancelled + OFFER_TAKEN)
- *   → En Route → Inspect → Quote → Approve Quote (Escrow Hold)
- *   → Start Work → Serials → Privacy Checklist + Handover OTP
- *   → Complete Handover (Warranty ACTIVE + Escrow Released/Split)
- *   → Review → Claim → Admin Approval (claim-rate feedback)
+ * Covers catalog and advisory, then resumes a saved Phase 1 dispatch order
+ * through quote approval, handover, review and warranty claims. New managed
+ * order creation and funding run against PostgreSQL in the Phase 11A suite.
  */
 import { ConflictException } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import type { Prisma, ServiceKey } from '@prisma/client';
 import { UserRole } from '@prisma/client';
 import { AppConfigService } from '@config/app-config.service';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
@@ -139,7 +134,6 @@ function createInMemoryPrisma() {
     createdAt: new Date(),
     updatedAt: new Date(),
   }));
-  const defByKey = new Map(serviceDefinitions.map((d) => [d.key as string, d]));
   const defById = new Map(serviceDefinitions.map((d) => [d.id as string, d]));
   const advisoryRulesRows: Array<Record<string, unknown>> = advisoryRulesSeed.map((rule) => ({
     ...(rule as unknown as Record<string, unknown>),
@@ -172,7 +166,7 @@ function createInMemoryPrisma() {
     },
     {
       id: 'tp-b', userId: 't2', status: 'APPROVED', isOnline: false, isAcceptingOffers: true,
-      skills: ['ALARM'], rating: 3.0, ratingCount: 50, warrantyClaimRate: 0.3,
+      skills: ['ALARM', 'CCTV'], rating: 3.0, ratingCount: 50, warrantyClaimRate: 0.3,
       completedJobs: 97, branchId: 'b1', lastKnownLat: null, lastKnownLng: null,
     },
   ];
@@ -186,7 +180,7 @@ function createInMemoryPrisma() {
     ['CUSTOMER:c1', { id: 'w-c1', ownerType: 'CUSTOMER', ownerId: 'c1', balance: 50_000_000n, heldInEscrow: 0n }],
     ['TECHNICIAN:t1', { id: 'w-t1', ownerType: 'TECHNICIAN', ownerId: 't1', balance: 0n, heldInEscrow: 0n }],
     ['TECHNICIAN:t2', { id: 'w-t2', ownerType: 'TECHNICIAN', ownerId: 't2', balance: 0n, heldInEscrow: 0n }],
-    [`PLATFORM:${PLATFORM_WALLET_OWNER_ID}`, { id: 'w-platform', ownerType: 'PLATFORM', ownerId: PLATFORM_WALLET_OWNER_ID, balance: 0n, heldInEscrow: 0n }],
+    [`PLATFORM:${PLATFORM_WALLET_OWNER_ID}`, { id: 'w-platform', ownerType: 'PLATFORM', ownerId: PLATFORM_WALLET_OWNER_ID, balance: 0n, heldInEscrow: 0n, restrictedReserve: 0n }],
   ]);
   const walletTransactions: Row[] = [];
   const warranties: Row[] = [];
@@ -209,6 +203,37 @@ function createInMemoryPrisma() {
       items,
       ...(address ? { address: { ...address, city: cities.find((c) => c.id === address['cityId']) } } : {}),
     };
+  };
+
+  const eligibleTechnicians = (where: Prisma.TechnicianProfileWhereInput = {}) => {
+    const ids = typeof where.id === 'object' && Array.isArray(where.id.in) ? where.id.in : undefined;
+    const skills = Array.isArray(where.skills?.hasEvery) ? where.skills.hasEvery : [];
+    return technicianProfiles.filter((row) =>
+      (typeof where.id !== 'string' || row.id === where.id) &&
+      (!ids || ids.includes(row.id)) &&
+      (!where.userId || row['userId'] === where.userId) &&
+      (!where.status || row['status'] === where.status) &&
+      (!where.isOnline || row['isOnline'] === where.isOnline) &&
+      (!where.isAcceptingOffers || row['isAcceptingOffers'] === where.isAcceptingOffers) &&
+      skills.every((skill) => (row['skills'] as ServiceKey[]).includes(skill)),
+    );
+  };
+
+  type BalanceChange = { increment?: bigint; decrement?: bigint };
+  type WalletMutation = {
+    where: { id: string; balance?: { gte?: bigint }; heldInEscrow?: { gte?: bigint } };
+    data: { balance?: BalanceChange; heldInEscrow?: BalanceChange; restrictedReserve?: BalanceChange };
+  };
+  const updateWallet = ({ where, data }: WalletMutation) => {
+    const row = [...wallets.values()].find((wallet) => wallet.id === where.id);
+    if (!row) return null;
+    if (where.balance?.gte !== undefined && (row['balance'] as bigint) < where.balance.gte) return null;
+    if (where.heldInEscrow?.gte !== undefined && (row['heldInEscrow'] as bigint) < where.heldInEscrow.gte) return null;
+    for (const key of ['balance', 'heldInEscrow', 'restrictedReserve'] as const) {
+      const change = data[key];
+      if (change) row[key] = (row[key] as bigint) + (change.increment ?? 0n) - (change.decrement ?? 0n);
+    }
+    return { ...row };
   };
 
   const db: Record<string, unknown> = {
@@ -247,6 +272,16 @@ function createInMemoryPrisma() {
         platformConfigRows.find((config) => config.key === where.key) ?? null,
       ),
     },
+    city: {
+      findFirst: jest.fn(async ({ where }: { where: { slug: string } }) => cities.find(({ slug }) => slug === where.slug) ?? null),
+    },
+    installationRateCard: {
+      findMany: jest.fn(async () => ['ALARM', 'CCTV'].map((serviceKey) => ({
+        id: `rate-${serviceKey}`, serviceKey, version: 1, cityId: 'city-mashhad', branchId: 'b1',
+        standardMinutes: 60, hourlyRate: 1_000_000n, minVisitWage: 1_000_000n, normalAllowance: 30_000n,
+        effortBps: 10_000, physicalDifficultyBps: 10_000, technicalDifficultyBps: 10_000, meteredLaborPerMeter: 1_000n,
+      }))),
+    },
     branch: {
       findFirst: jest.fn(async ({ where }: { where: { cityId?: string; isActive?: boolean } }) =>
         branches.find((b) =>
@@ -275,20 +310,8 @@ function createInMemoryPrisma() {
         const row = technicianProfiles.find((p) => p.userId === where.userId);
         return row ? { ...row } : null;
       }),
-      findMany: jest.fn(async ({ where }: { where?: { id?: { in?: string[] }; status?: string; isOnline?: boolean; isAcceptingOffers?: boolean; skills?: { hasSome?: string[] } } } = {}) => {
-        let rows = [...technicianProfiles];
-        const where_ = where ?? {};
-        if (where_.id?.in) rows = rows.filter((row) => (where_.id!.in as string[]).includes(row.id as string));
-        if (where_.status) rows = rows.filter((row) => row.status === where_.status);
-        if (where_.isOnline === true) rows = rows.filter((row) => row.isOnline === true);
-        if (where_.isAcceptingOffers === true) rows = rows.filter((row) => row.isAcceptingOffers === true);
-        if (where_.skills?.hasSome) {
-          rows = rows.filter((row) =>
-            (where_.skills!.hasSome as string[]).some((skill) => (row.skills as string[]).includes(skill)),
-          );
-        }
-        return rows;
-      }),
+      findMany: jest.fn(async ({ where }: { where?: Prisma.TechnicianProfileWhereInput } = {}) => eligibleTechnicians(where)),
+      findFirst: jest.fn(async ({ where }: { where?: Prisma.TechnicianProfileWhereInput } = {}) => eligibleTechnicians(where)[0] ?? null),
       update: jest.fn(async ({ where, data }: { where: { userId?: string; id?: string }; data: Record<string, unknown> }) => {
         const row = technicianProfiles.find(
           (p) => (where.userId !== undefined ? p.userId === where.userId : p.id === where.id),
@@ -390,7 +413,8 @@ function createInMemoryPrisma() {
         if (include?.['technician']) {
           result['technician'] = technicianProfiles.find((p) => p.id === row['technicianId']);
         }
-        if (include?.['order']) result['order'] = { ...serviceOrders.find((o) => o.id === row['orderId']) };
+        const order = serviceOrders.find((o) => o.id === row['orderId']);
+        if (include?.['order'] && order) result['order'] = orderWithIncludes(order);
         return result;
       }),
       findMany: jest.fn(async (args?: { where?: { orderId?: string; status?: string; technicianId?: { in?: string[]; not?: string } }; include?: Record<string, boolean>; select?: Record<string, boolean> }) => {
@@ -407,8 +431,11 @@ function createInMemoryPrisma() {
         }
         return rows.map((row) => ({ ...row }));
       }),
+      findFirst: jest.fn(async ({ where }: { where: { orderId: string } }) =>
+        dispatchOffers.filter((offer) => offer['orderId'] === where.orderId).at(-1) ?? null,
+      ),
       create: jest.fn(async ({ data }: { data: Row }) => {
-        const row = { ...data, id: nextId('offer'), respondedAt: null };
+        const row = { ...data, id: nextId('offer'), status: 'PENDING', respondedAt: null };
         dispatchOffers.push(row);
         return { ...row };
       }),
@@ -417,13 +444,15 @@ function createInMemoryPrisma() {
         Object.assign(row, data);
         return { ...row };
       }),
-      updateMany: jest.fn(async ({ where, data }: { where: { orderId?: string; status?: string; technicianId?: { not?: string }; id?: { in?: string[] } }; data: Row }) => {
+      updateMany: jest.fn(async ({ where, data }: { where: { orderId?: string; status?: string; technicianId?: { not?: string }; id?: string | { in?: string[] }; expiresAt?: { gt: Date } }; data: Row }) => {
         let count = 0;
         for (const row of dispatchOffers) {
           if (where.orderId && row['orderId'] !== where.orderId) continue;
           if (where.status && row['status'] !== where.status) continue;
           if (where.technicianId?.not && row['technicianId'] === where.technicianId.not) continue;
-          if (where.id?.in && !where.id.in.includes(row.id as string)) continue;
+          if (typeof where.id === 'string' && where.id !== row.id) continue;
+          if (typeof where.id === 'object' && where.id.in && !where.id.in.includes(row.id)) continue;
+          if (where.expiresAt && (row['expiresAt'] as Date) <= where.expiresAt.gt) continue;
           Object.assign(row, data);
           count += 1;
         }
@@ -521,24 +550,11 @@ function createInMemoryPrisma() {
         const row = wallets.get(`${where.ownerType_ownerId.ownerType}:${where.ownerType_ownerId.ownerId}`);
         return row ? { ...row } : null;
       }),
-      update: jest.fn(async ({ where, data }: { where: { id: string }; data: { balance?: { increment?: bigint; decrement?: bigint } } }) => {
-        const row = [...wallets.values()].find((w) => w.id === where.id) as Row;
-        if (data.balance?.increment) row['balance'] = (row['balance'] as bigint) + data.balance.increment;
-        if (data.balance?.decrement) row['balance'] = (row['balance'] as bigint) - data.balance.decrement;
-        return { ...row };
-      }),
-      updateMany: jest.fn(async ({ where, data }: { where: { id: string; balance?: { gte?: bigint }; heldInEscrow?: { gte?: bigint } }; data: { balance?: { increment?: bigint; decrement?: bigint }; heldInEscrow?: { increment?: bigint; decrement?: bigint } } }) => {
-        const row = [...wallets.values()].find((w) => w.id === where.id) as Row | undefined;
-        if (!row) return { count: 0 };
-        const balance = row['balance'] as bigint;
-        const escrow = row['heldInEscrow'] as bigint;
-        if (where.balance?.gte !== undefined && balance < where.balance.gte) return { count: 0 };
-        if (where.heldInEscrow?.gte !== undefined && escrow < where.heldInEscrow.gte) return { count: 0 };
-        if (data.balance?.increment) row['balance'] = balance + data.balance.increment;
-        if (data.balance?.decrement) row['balance'] = balance - data.balance.decrement;
-        if (data.heldInEscrow?.increment) row['heldInEscrow'] = escrow + data.heldInEscrow.increment;
-        if (data.heldInEscrow?.decrement) row['heldInEscrow'] = escrow - data.heldInEscrow.decrement;
-        return { count: 1 };
+      update: jest.fn(async (mutation: WalletMutation) => updateWallet(mutation)),
+      updateMany: jest.fn(async (mutation: WalletMutation) => ({ count: updateWallet(mutation) ? 1 : 0 })),
+      updateManyAndReturn: jest.fn(async (mutation: WalletMutation) => {
+        const row = updateWallet(mutation);
+        return row ? [row] : [];
       }),
     },
     walletTransaction: {
@@ -551,6 +567,10 @@ function createInMemoryPrisma() {
         return row;
       }),
     },
+    $queryRaw: jest.fn(async (query: TemplateStringsArray, id: string) => {
+      const rows = query[0]?.includes('"ServiceOrder"') ? serviceOrders : technicianProfiles;
+      return rows.filter((row) => row.id === id);
+    }),
     $transaction: jest.fn(async (fn: (tx: unknown) => unknown) => fn(db)),
   };
   // Expose the raw stores for test assertions & seeding.
@@ -614,13 +634,6 @@ describe('PHASE 1 — full lifecycle e2e (Catalog → … → Review → Claim)'
   );
   const reviews = new ReviewsService(prisma);
 
-  // Wire submit → dispatch (same contract as @OnEvent in production).
-  let dispatchPromise: Promise<unknown> | undefined;
-  const eventEmitter = new EventEmitter2();
-  eventEmitter.on('order.searching', (payload: { orderId: string }) => {
-    dispatchPromise = dispatch.onOrderSearching(payload);
-  });
-
   let orderId = '';
   let handoverOtp = '';
 
@@ -638,9 +651,10 @@ describe('PHASE 1 — full lifecycle e2e (Catalog → … → Review → Claim)'
     expect(result.advisories.map((a) => a.code)).toContain('SHOP_CCTV_NO_ALARM');
   });
 
-  it('STEP 3 — pricing estimates the ALARM+CCTV bundle in BigInt Toman', async () => {
+  it('STEP 3 — pricing estimates the install-only ALARM+CCTV bundle in BigInt Toman', async () => {
     const result = await pricing.estimate({
       citySlug: 'mashhad',
+      supplyMode: 'INSTALL_ONLY',
       items: [
         { serviceKey: 'ALARM', config: {} },
         { serviceKey: 'CCTV', config: {} },
@@ -648,49 +662,34 @@ describe('PHASE 1 — full lifecycle e2e (Catalog → … → Review → Claim)'
     });
     expect(result.currency).toBe('TOMAN');
     expect(typeof result.netEstimated).toBe('bigint');
-    expect(result.summary.totalHardware).toBeGreaterThan(0n);
+    expect(result.summary).toEqual({ totalHardware: 0n, bundleDiscountPercent: 6 });
+    expect(result.invoice.buckets.map(({ bucket }) => bucket)).toEqual(['FIXED', 'SERVICE_PACKAGE', 'METERED']);
   });
 
-  it('STEP 4 — customer creates the order (ESTIMATED + snapshot + audit)', async () => {
+  it('STEP 4 — resumes a saved Phase 1 order in SEARCHING_EXPERT', async () => {
     prisma['addresses'].push({
       id: 'addr1', customerId: 'cp1', cityId: 'city-mashhad', locationType: 'SHOP',
       lat: 36.3, lng: 59.6, isDefault: true,
     });
-    const result = await orders.create(customer, {
-      addressId: 'addr1',
-      urgency: 'SCHEDULED',
-      supplyMode: 'FULL_PACKAGE',
-      items: [
-        { serviceKey: 'ALARM', config: { petImmune: true } },
-        { serviceKey: 'CCTV', config: { cameraCount: 4 } },
-      ],
+    orderId = 'legacy-order';
+    prisma.serviceOrders.push({
+      id: orderId, orderNumber: 'HM-2026-000001', customerId: customer.id, branchId: 'b1',
+      addressId: 'addr1', state: 'SEARCHING_EXPERT', technicianId: null, pricingVersion: 1,
+      urgency: 'SCHEDULED', supplyMode: 'FULL_PACKAGE', locationType: 'SHOP', lat: 36.3, lng: 59.6,
     });
-    orderId = result.order['id'] as string;
-    expect(result.order['state']).toBe('ESTIMATED');
-    const storedPricing = result.order['pricing'] as Record<string, unknown>;
-    const storedSummary = storedPricing['summary'] as Record<string, unknown>;
-    expect(storedSummary['bundleDiscountPercent']).toBe(6);
-    expect(storedSummary['totalHardware']).toBe(String(result.estimate.summary.totalHardware));
+    prisma.orderItems.push(
+      { id: 'legacy-alarm', orderId, serviceDefinitionId: 'def-ALARM' },
+      { id: 'legacy-cctv', orderId, serviceDefinitionId: 'def-CCTV' },
+    );
+    await expect(orders.getOne(customer, orderId)).resolves.toMatchObject({ state: 'SEARCHING_EXPERT', pricingVersion: 1 });
   });
 
-  it('STEP 5 — submit auto-kickoffs dispatch → 2 weighted offers (both techs online near the shop)', async () => {
+  it('STEP 5 — resumes auto-dispatch and sends two weighted offers to nearby technicians', async () => {
     // Both technicians go online inside the first 5000m ring.
     await dispatch.setTechnicianStatus(techA, { isOnline: true, lat: 36.3015, lng: 59.6 });
     await dispatch.setTechnicianStatus(techB, { isOnline: true, lat: 36.3025, lng: 59.6 });
 
-    await orders.submit(customer, orderId);
-    await dispatchPromise;
-    // DEBUG
-    try {
-      const dbg = await dispatch.startSearch(orderId);
-      process.stdout.write(
-        `DEBUG SEARCH: ${JSON.stringify(dbg)} offersLen=${prisma['dispatchOffers'].length} txLen=${prisma['walletTransactions'].length}\n`,
-      );
-      const created = prisma['dispatchOffers'].map((o) => `${o['id']}:${o['orderId']}:${o['technicianId']}`);
-      process.stdout.write(`DEBUG offers: ${JSON.stringify(created)}\n`);
-    } catch (error: unknown) {
-      process.stdout.write(`DEBUG SEARCH ERROR: ${error instanceof Error ? error.stack : String(error)}\n`);
-    }
+    await expect(dispatch.startSearch(orderId)).resolves.toMatchObject({ offersCreated: 2 });
 
     const offers = prisma['dispatchOffers'].filter((offer) => offer['orderId'] === orderId);
     expect(offers).toHaveLength(2);
@@ -725,16 +724,13 @@ describe('PHASE 1 — full lifecycle e2e (Catalog → … → Review → Claim)'
     await expect(dispatch.acceptOffer(techB, offerB.id as string)).rejects.toThrow(ConflictException);
   });
 
-  it('STEP 7 — en route → inspection → technician quote (2,000,000 Toman)', async () => {
+  it('STEP 7 — en route → inspection, where an existing saved quote can still be approved', async () => {
     await orders.enRoute(techA, orderId);
     await orders.startInspection(techA, orderId);
-    await orders.quote(techA, orderId, { finalQuoteAmount: 2_000_000 });
-    const order = prisma['serviceOrders'].find((o) => o.id === orderId) as Row;
+    const order = prisma.serviceOrders.find((o) => o.id === orderId);
+    if (!order) throw new Error('Legacy order missing');
     expect(order['state']).toBe('INSPECTING');
-    expect(order['finalQuoteAmount']).toBe(2_000_000n);
-    expect(notifications.send).toHaveBeenCalledWith(
-      expect.objectContaining({ titleFa: 'پیش‌فاکتور نهایی آماده است' }),
-    );
+    order['finalQuoteAmount'] = 2_000_000n;
   });
 
   it('STEP 8 — approve-quote holds the escrow INSIDE the transition', async () => {
@@ -787,23 +783,18 @@ describe('PHASE 1 — full lifecycle e2e (Catalog → … → Review → Claim)'
     expect(order['completedAt']).toBeInstanceOf(Date);
 
     // Digital warranty — per-item coverage min(12, 18) = 12 months.
-    expect(result.warranty.policyNumber).toMatch(/^WR-\d{4}-\d{6}$/);
-    expect(result.warranty.coverageMonths).toBe(12);
-    expect(result.warranty.warrantyReserveAmount).toBe(100_000n); // 5% of 2M
-    expect(result.warranty.status).toBe('ACTIVE');
-
-    // Escrow split: 10% showroom commission (200k) + 5% reserve (100k) + 1.7M payout.
-    expect(result.escrowSplit.platformCommission).toBe(200_000n);
-    expect(result.escrowSplit.warrantyReserve).toBe(100_000n);
-    expect(result.escrowSplit.technicianPayout).toBe(1_700_000n);
-    expect(
-      result.escrowSplit.platformCommission + result.escrowSplit.warrantyReserve + result.escrowSplit.technicianPayout,
-    ).toBe(2_000_000n);
+    expect(result.warrantyPolicyNumber).toMatch(/^WR-\d{4}-\d{6}$/);
+    expect(result.coverageMonths).toBe(12);
+    expect(result.guaranteedNetPayout).toBe(1_700_000n);
+    expect(prisma.warranties).toEqual([expect.objectContaining({
+      policyNumber: result.warrantyPolicyNumber, warrantyReserveAmount: 100_000n, status: 'ACTIVE',
+    })]);
 
     const platformWallet = prisma['wallets'].get(`PLATFORM:${PLATFORM_WALLET_OWNER_ID}`) as Row;
     const techWallet = prisma['wallets'].get('TECHNICIAN:t1') as Row;
     const customerWallet = prisma['wallets'].get('CUSTOMER:c1') as Row;
-    expect(platformWallet['balance']).toBe(300_000n);
+    expect(platformWallet['balance']).toBe(200_000n);
+    expect(platformWallet['restrictedReserve']).toBe(100_000n);
     expect(techWallet['balance']).toBe(1_700_000n);
     expect(customerWallet['heldInEscrow']).toBe(0n);
 

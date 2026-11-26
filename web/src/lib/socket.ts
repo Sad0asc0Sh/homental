@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
+import type { DispatchOfferView, MeteredAdjustment, TechnicianMeteredAdjustment } from '@/lib/api';
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'http://localhost:3000';
 
@@ -13,18 +14,20 @@ export const DISPATCH_EVENTS = [
   'EXPERT_LOCATION_UPDATE',
   'FINAL_QUOTE_READY',
   'WARRANTY_ACTIVATED',
+  'METERED_ADJUSTMENT_CHANGED',
 ] as const;
 
 export type DispatchEventName = (typeof DISPATCH_EVENTS)[number];
 
 export interface DispatchEventPayloads {
   ORDER_SEARCHING: { orderId: string; radiusMeters?: number; offersCreated?: number };
-  DISPATCH_OFFER: { offerId: string; orderId: string; orderNumber: string; score: number; expiresInMs: number };
+  DISPATCH_OFFER: DispatchOfferView;
   OFFER_TAKEN: { orderId: string; offerId: string; takenByAnotherExpert: boolean };
   EXPERT_ASSIGNED: { orderId: string; technicianUserId: string };
   EXPERT_LOCATION_UPDATE: { orderId: string; lat: number; lng: number; timestamp: string };
   FINAL_QUOTE_READY: { orderId: string; finalQuoteAmount?: number };
   WARRANTY_ACTIVATED: { orderId: string; warrantyId: string; policyNumber: string };
+  METERED_ADJUSTMENT_CHANGED: { orderId: string; adjustment: MeteredAdjustment | TechnicianMeteredAdjustment };
   notification: { raw: string };
 }
 

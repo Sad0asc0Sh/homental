@@ -52,6 +52,7 @@ src/
 │   ├── cities-branches/ (Task 2)
 │   ├── wallet-escrow/ (Task 5)
 │   ├── notifications/ (Task 2 core, Task 6 realtime)
+│   ├── partner-supply/      B2B checkout, seller portal, and supplier after-sales
 │   └── security-services/   THE Phase-1 vertical
 │       ├── catalog/    schema-driven service definitions (Task 3)
 │       ├── advisory/   JSON-Logic readiness engine, 0–100 scores, max 2 suggestions (Task 3)
@@ -64,6 +65,9 @@ src/
 
 **Dependency rule:** `infrastructure` → `config` → `common`; `modules/*` may
 import core modules + infrastructure; **core modules never import verticals**.
+`partner-supply` and `security-services` share inventory, escrow, and fulfillment
+records through Prisma and the core wallet service. The two verticals have no
+imports between them.
 
 ## 4. Build order (locked)
 
@@ -73,6 +77,9 @@ import core modules + infrastructure; **core modules never import verticals**.
 - Task 4 — Dynamic pricing engine ✅ (`POST /api/v1/pricing/estimate` guest endpoint + `includePricing` inside advisor/evaluate for the one-call Sticky Live Bar; `PricingSchemaInterpreter` handles all three unit-price forms w/ clamped quantities & per-item `supplyMode`; `DynamicFactorsService` reads `pricing.surge`/`pricing.urgency`/`pricing.bundleDiscount` from PlatformConfig — **supply/demand** surge (activeTechs/pendingOrders) clamped at the 1.25 trust cap w/ graceful 1.0 fallback; BigInt-only money, bundle tiers 6%/10%, hardware absolutely isolated from surge/urgency (hard-guarded), `estimatedMin/Max` rounded to 100k Toman)
 - Task 5 — Orders, state machine & escrow ✅ (CORE `wallet-escrow` module: tx-composable `topUp`/`holdEscrow` (atomic overdraft guard)/`refundEscrow`/`releaseEscrowAndSplit` w/ zero-drift BigInt split, dual-commission branch overrides, derived idempotency keys, rate-sum ≤ 1 guard, loud PLATFORM-wallet errors; wallet endpoints. VERTICAL `orders`: explicit 12-state `ALLOWED_TRANSITIONS` map + optimistic guarded transitions + append-only `OrderStateTransition` audit; order creation persists BigInt-safe pricing snapshots + per-item supplyMode; role/branch-scoped reads; approve-quote holds escrow INSIDE the state transition; cancel from QUOTE_APPROVED refunds atomically; IN_PROGRESS+ not cancellable; BRANCH_QUEUE fallback)
 - Task 6 — Dispatch, realtime & warranty lock ✅ **(PHASE 1 BACKEND COMPLETE)** — Realtime WS gateway `/dispatch` (JWT handshake, `user:{id}`/`order:{id}` rooms, permission-checked `join_order`, Redis `notifications:user:*` bridge for horizontal scaling); Dispatch engine (GEO status/location sync, pure weighted candidate scorer with neutral-70 rookie rating, expanding-radius waves 5000→12000→19000 w/ `maxParallelOffers`, 30s TTL offers, atomic single-winner accept behind the per-order `SET NX PX` lock + Lua release, decline/expiry sweeper, `BRANCH_QUEUE` fallback w/ `NO_TECHNICIAN_IN_RADIUS` audit + branch-admin notification); Mandatory Handover Gate (serials on FULL_PACKAGE items → privacy checklist → customer OTP, 3-attempt lock, scrypt+timingSafeEqual) atomically completing warranty (`WR-YYYY-XXXXXX`, per-item coverage, min months) + escrow release/split + `completedJobs` in ONE transaction; Warranty card/claims w/ claim-rate + rating feedback loops into dispatch scoring; verified by a 13-step end-to-end lifecycle suite
+- Phase 11A — Managed pricing, three-part invoice, escrow at submit, shared seller inventory, and isolated warranty and fulfillment reserves ✅
+- Phase 11B — Funded bargaining slider, priority-wave dispatch, and exact centimetre reconciliation with wallet recovery ✅
+- Phase 11C — Technician procurement and seller portal. B2B and B2C draw on the same stock. B2B settles seller goods proceeds and restricted freight when the final shipment is delivered. Supplier cases support unused returns, exchanges, repairs, and technical guidance ✅
 - Task 7+ — Phase 2 backlog (multi-city branches, verified second-hand goods, hourly space/cafe booking — reuse core modules as-is)
 
 ## 5. Verification bar

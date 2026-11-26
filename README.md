@@ -55,7 +55,7 @@ price range → review the Smart Brief → login with phone OTP (dev code echoed
 With `OTP_DEV_ECHO=true` (dev only), login codes and handover OTPs are echoed in API
 responses — Zod fails fast if enabled in production.
 
-## Demo Walkthrough — full 4-role Mashhad loop in ~5 minutes
+## Demo Walkthrough — five-role Mashhad pilot
 
 Seed data (after `npm run prisma:seed`) contains these Mashhad pilot phone numbers (login
 = phone OTP via the header **ورود** button on any page or inline login prompt; both
@@ -67,32 +67,34 @@ canonical `+989...` and local `09...` formats work, with `devCode` echoed in dev
 | Technician 1 | `+989120000010` (`09120000010`, امیر کریمی) | ALARM + CCTV, rating ۴.۸ |
 | Technician 2 | `+989120000011` (`09120000011`, رضا احمدی) | ELECTRIC_SHUTTER + PARKING_JACK, rating ۴.۶ |
 | Technician 3 | `+989120000012` (`09120000012`, مهدی نوری) | all 4 skills, rating ۴.۹ |
+| Seller | `+989120000030` (`09120000030`, تأمین تجهیزات امنیتی مشهد) | CCTV offers, inbound shipments, supplier cases, and wallet in `/seller` |
 | Mashhad Branch Admin | `+989120000002` (`09120000002`, حسین رضایی) | شعبه مرکزی مشهد — ۱۰٪ commission override |
 | Super Admin | `+989120000001` (`09120000001`, مدیر سامانه) | full platform control & `/admin` finance reserve dashboard |
 
-Steps (use **two browser windows/profiles** — one Customer, one Technician/Branch Admin):
+Use separate browser profiles to keep the customer, technician, and seller sessions active.
 
 1. **Technician**: open `/technician` and login via the header **ورود** button (or inline
    prompt) → pick **وکیل‌آباد** preset → toggle **آنلاین** so the tech is registered in
    Redis GEO and ready for live Socket.io dispatch offers.
 2. **Customer**: open `/` → pick «فروشگاه / مغازه» → apply the one-click advisory
    («+ اعمال پیشنهاد») → continue to `/brief` → choose urgency «فوری» → login with OTP →
-   register Mashhad address → **ثبت پرونده امنیتی و اعزام کارشناس** (redirects to `/order/[id]`).
+   set the package slider → register a Mashhad address → **ثبت پرونده امنیتی و اعزام کارشناس**.
+   The invoice funds escrow at submit and `/order/[id]` shows the hold and dispatch status.
 3. **Technician**: the live offer card appears on `/technician` with a 30-second countdown
    (losing techs receive `OFFER_TAKEN` and dismiss immediately) → click **پذیرش سفارش**,
-   then **شروع حرکت** → **رسیدم / شروع کارشناسی** → submit the final quote in Toman.
-4. **Customer** (`/order/[id]`, live via Socket.io): watch the 9-stage Persian timeline and
-   live technician coordinates badge update → in `INSPECTING` the Escrow quote card
-   appears (with inline quick wallet top-up if short) → **تأیید قیمت و پرداخت امن (Escrow)**.
-5. **Technician**: **شروع نصب و اجرا** → enter hardware serial numbers for `FULL_PACKAGE`
-   items (`INSTALL_ONLY` items show exempt) → check BOTH mandatory privacy checklist boxes →
+   then **شروع حرکت** → **رسیدم / شروع کارشناسی** → **تأیید تطابق محل و شروع کار**.
+4. **Technician and customer** — The technician records actual cable and duct measurements with
+   photo references. Lower usage refunds the difference automatically. If usage is higher,
+   the customer can approve the difference in `/order/[id]` and charge the exact wallet shortfall.
+5. **Technician** — After metered reconciliation, enter the required hardware serial numbers,
+   check both mandatory privacy checklist boxes, and select
    **صدور کد تحویل (OTP) برای مشتری** (`devHandoverOtp` shown in dev mode) → enter the
    6-digit SMS code → **تکمیل تحویل، فعال‌سازی ضمانت و تسویه**.
 6. **Customer**: `/warranties` displays the new `WR-YYYY-XXXXXX` Digital Warranty
    Certificate card (`daysRemaining` + serials) → submit a test claim (**ثبت تیکت خرابی ضمانت**);
-   on `/order/[id]` submit a 1–5 star review, and inspect ledger splits on `/wallet`.
+   on `/order/[id]` submit a 1–5 star review, and review personal postings on `/wallet`.
 7. **Branch Admin** (`/branch`):
-   - **صف سفارش‌ها**: filter `BRANCH_QUEUE` & manually assign an `APPROVED` technician.
+   - **صف سفارش‌ها** — Filter `BRANCH_QUEUE` and send a five-minute invitation to an approved technician.
    - **مدیریت تکنسین‌ها**: view skills/rating/claim rate/online status, approve/suspend, or add a technician.
    - **رسیدگی به تیکت‌های ضمانت**: update claim status (`IN_REVIEW` / `APPROVED` / `RESOLVED` / `REJECTED`) with `resolutionNoteFa` — customer's warranty returns to `ACTIVE` once resolved.
 8. **Super Admin** (`/admin`):
@@ -100,11 +102,18 @@ Steps (use **two browser windows/profiles** — one Customer, one Technician/Bra
    - **توسعه شهرها و نمایندگی‌ها**: launch/toggle cities and configure showroom partner branches & rate overrides.
    - **قوانین مشاوره هوشمند**: manage JSON-Logic rules live.
    - **تنظیمات داینامیک پلتفرم**: tune Surge cap (≤ ۱.۲۵), Urgency multipliers, Bundle tiers, Escrow split, and Dispatch scoring weights without redeploying.
+9. **Technician procurement** — Open `/technician/supply`. Add a CCTV item to the cart, review the
+   partner price and bike or car estimate, then fund the order from the technician wallet. The demo
+   uses the existing wallet top-up flow.
+10. **Seller** — Open `/seller` with the seller account and mark the shipment dispatched. Confirm
+    delivery from the seller or technician screen. The seller wallet shows the goods payout once
+    all shipments arrive. The technician can open a return, exchange, or repair from a delivered
+    line, or start a technical guidance conversation. The seller handles these in the after-sales tab.
 
 ## Repository Layout
 
 ```
-├── prisma/            schema.prisma (23 models, PostGIS), seed.ts, migrations/
+├── prisma/            schema.prisma (PostGIS), seed.ts, migrations/
 ├── src/               NestJS modular monolith
 │   ├── config/        Zod-validated typed AppConfig
 │   ├── common/        guards (@Public/@Roles/@CurrentUser), filters, BigInt serializer
@@ -112,6 +121,7 @@ Steps (use **two browser windows/profiles** — one Customer, one Technician/Bra
 │   └── modules/
 │       ├── admin-config, auth, users, cities-branches, notifications, wallet-escrow ← CORE (vertical-agnostic)
 │       ├── health
+│       ├── partner-supply/                    ← B2B checkout, seller portal, after-sales
 │       └── security-services/                                          ← THE Phase-1 vertical
 │           ├── catalog (schema-driven), advisory (JSON-Logic 3-pillar scoring)
 │           ├── pricing (BigInt interpreter, surge/urgency/bundles)
@@ -127,7 +137,7 @@ Steps (use **two browser windows/profiles** — one Customer, one Technician/Bra
 
 | Command | Purpose |
 |---|---|
-| `npm run build` / `lint` / `test` | 28 suites, 282 tests |
+| `npm run build` / `lint` / `test` | Backend verification |
 | `npm run prisma:generate` / `deploy` / `migrate` / `seed` | DB tooling |
 | `npm run infra:up` / `down` | docker compose lifecycle |
 | `npm run start:dev` | watch mode on :3000 |

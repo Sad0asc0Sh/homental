@@ -10,6 +10,7 @@ interface AuthState {
   refreshToken: string | null;
   phone: string | null;
   user: { id: string; phone: string; role: string } | null;
+  setHasHydrated: () => void;
   requestOtp: (phone: string) => Promise<{ devCode?: string }>;
   verifyOtp: (phone: string, code: string) => Promise<void>;
   logout: () => void;
@@ -23,6 +24,7 @@ export const useAuthStore = create<AuthState>()(
       refreshToken: null,
       phone: null,
       user: null,
+      setHasHydrated: () => set({ hasHydrated: true }),
       requestOtp: async (phone) => {
         const result = await api.otpRequest(phone);
         return { devCode: result.devCode };
@@ -51,7 +53,9 @@ export const useAuthStore = create<AuthState>()(
       }),
       onRehydrateStorage: () => (state) => {
         setTokens(state?.accessToken ?? null, state?.refreshToken ?? null);
-        useAuthStore.setState({ hasHydrated: true });
+        // NOTE: in zustand v4 this callback may NOT fire when storage is
+        // empty (first visit) — AppHeader flips the flag after mount too.
+        state?.setHasHydrated?.();
       },
     },
   ),

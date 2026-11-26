@@ -1,6 +1,7 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
-import { UserRole } from '@prisma/client';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import { UserRole, type DispatchOfferStatus, type OrderState } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
+import type { AppConfigService } from '@config/app-config.service';
 import type { PrismaService } from '@infra/prisma/prisma.service';
 import type { RedisService } from '@infra/redis/redis.service';
 import type { RealtimeService } from '@infra/realtime/realtime.service';
@@ -9,23 +10,50 @@ import { DispatchService } from './dispatch.service';
 import { DispatchSweeperService } from './dispatch-sweeper.service';
 
 const techA = { id: 'tp-a', userId: 't1', status: 'APPROVED', isOnline: true, isAcceptingOffers: true, skills: ['ALARM', 'CCTV'], rating: 4.9, ratingCount: 210, warrantyClaimRate: 0.01, branchId: 'b1' };
-const techB = { id: 'tp-b', userId: 't2', status: 'APPROVED', isOnline: true, isAcceptingOffers: true, skills: ['ALARM'], rating: 3.0, ratingCount: 50, warrantyClaimRate: 0.3, branchId: 'b1' };
+const techB = { id: 'tp-b', userId: 't2', status: 'APPROVED', isOnline: true, isAcceptingOffers: true, skills: ['ALARM', 'CCTV'], rating: 4.8, ratingCount: 5, warrantyClaimRate: 0.3, branchId: 'b1' };
 
 const actorT1 = { id: 't1', phone: '+989120000010', role: UserRole.TECHNICIAN, branchId: 'b1' } as AuthenticatedUser;
 const actorT2 = { id: 't2', phone: '+989120000011', role: UserRole.TECHNICIAN, branchId: 'b1' } as AuthenticatedUser;
 
-function buildDispatch(options?: { lockAcquired?: boolean }) {
+interface OfferRow {
+  id: string;
+  orderId: string;
+  technicianId: string;
+  radiusMeters: number;
+  score: number;
+  wave: number;
+  audience: 'TOP' | 'ALL';
+  attempt: number;
+  status: DispatchOfferStatus;
+  respondedAt: Date | null;
+  expiresAt: Date;
+  isBranchInvite: boolean;
+}
+
+interface OfferFilter {
+  id?: string;
+  orderId?: string;
+  status?: DispatchOfferStatus;
+  attempt?: number;
+  isBranchInvite?: boolean;
+  expiresAt?: { gt: Date } | { lte: Date };
+}
+
+function buildDispatch(options?: { lockAcquired?: boolean; sliderBps?: number; revisionStatus?: 'DRAFT' | 'FUNDED' }) {
   let offerSeq = 0;
-  const offers: Array<Record<string, unknown>> = [];
-  const orderState = { state: 'SEARCHING_EXPERT' };
+  let orderState: OrderState = 'SEARCHING_EXPERT';
+  const offers: OfferRow[] = [];
+  const technicians = [techA, techB];
+  let locked = false;
 
   const order = {
     id: 'o1',
     orderNumber: 'HM-2026-000001',
     customerId: 'c1',
     technicianId: null,
+    pricingVersion: options?.sliderBps === undefined ? 1 : 2,
+    activeRevision: 1,
     branchId: 'b1',
-    state: orderState.state,
     lat: 36.3,
     lng: 59.6,
     address: { city: { slug: 'mashhad' } },
@@ -35,12 +63,29 @@ function buildDispatch(options?: { lockAcquired?: boolean }) {
     ],
   };
 
+  function findOffers(where: OfferFilter = {}) {
+    const { id, orderId, status, attempt, isBranchInvite, expiresAt } = where;
+    return offers.filter((offer) =>
+      (id === undefined || offer.id === id) &&
+      (orderId === undefined || offer.orderId === orderId) &&
+      (status === undefined || offer.status === status) &&
+      (attempt === undefined || offer.attempt === attempt) &&
+      (isBranchInvite === undefined || offer.isBranchInvite === isBranchInvite) &&
+      (!expiresAt || ('gt' in expiresAt ? offer.expiresAt > expiresAt.gt : offer.expiresAt <= expiresAt.lte)),
+    );
+  }
+
   const redis = {
     orderLockKey: (orderId: string) => `dispatch:order:lock:${orderId}`,
-    acquireOrderLock: jest
-      .fn()
-      .mockResolvedValue({ acquired: options?.lockAcquired ?? true, token: 'tok-1', key: 'lock' }),
-    releaseOrderLock: jest.fn().mockResolvedValue(true),
+    acquireOrderLock: jest.fn(async () => {
+      const acquired = !locked && options?.lockAcquired !== false;
+      if (acquired) locked = true;
+      return { acquired, token: acquired ? 'tok-1' : null, key: 'lock' };
+    }),
+    releaseOrderLock: jest.fn(async () => {
+      locked = false;
+      return true;
+    }),
     findNearbyTechs: jest.fn().mockResolvedValue([
       { techId: 'tp-a', distanceMeters: 4000, longitude: 59.6, latitude: 36.3 },
       { techId: 'tp-b', distanceMeters: 1000, longitude: 59.6, latitude: 36.3 },
@@ -49,86 +94,78 @@ function buildDispatch(options?: { lockAcquired?: boolean }) {
 
   const prisma = {
     platformConfig: { findUnique: jest.fn().mockResolvedValue(null) }, // defaults
+    orderPriceRevision: { findUnique: jest.fn().mockResolvedValue({
+      status: options?.revisionStatus ?? 'FUNDED', sliderBps: options?.sliderBps ?? 0, technicianTermsJson: { agreedPackageNet: '4500000' },
+    }) },
     serviceOrder: {
-      findUnique: jest.fn().mockImplementation(({ include }: { include?: Record<string, unknown> } = {}) => {
-        const row: Record<string, unknown> = { ...order, state: orderState.state };
-        if (include?.['items']) {
-          row['items'] = [
-            { serviceDefinition: { key: 'ALARM' } },
-            { serviceDefinition: { key: 'CCTV' } },
-          ];
-        }
-        if (include?.['branch']) {
-          row['branch'] = { id: 'b1', admin: { id: 'a1' } };
-        }
-        return row;
+      findUnique: jest.fn(async () => ({ ...order, state: orderState })),
+      findMany: jest.fn(async () =>
+        orderState === 'SEARCHING_EXPERT' && !findOffers({ status: 'PENDING' }).length ? [{ id: order.id }] : [],
+      ),
+      update: jest.fn(async ({ data }: { data: { state: OrderState } }) => {
+        orderState = data.state;
+        return { ...order, state: orderState, branch: { adminId: 'a1' } };
       }),
-      updateMany: jest.fn(async ({ data }: { data: { state?: string; technicianId?: string } }) => {
-        if (data.state) orderState.state = data.state;
+      updateMany: jest.fn(async ({ where, data }: {
+        where: { id: string; state: OrderState };
+        data: { state: OrderState };
+      }) => {
+        if (where.id !== order.id || where.state !== orderState) return { count: 0 };
+        orderState = data.state;
         return { count: 1 };
       }),
     },
     technicianProfile: {
-      findMany: jest.fn(async ({ where }: { where?: { id?: { in?: string[] } } } = {}) => {
-        let rows = [techA, techB];
-        if (where?.id?.in) rows = rows.filter((tech) => (where.id!.in as string[]).includes(tech.id));
-        return rows;
-      }),
+      findMany: jest.fn(async ({ where }: { where: {
+        id: { in: string[] }; skills: { hasEvery: string[] }; rating?: { gte: number }; ratingCount?: { gte: number };
+      } }) =>
+        technicians.filter((tech) =>
+          where.id.in.includes(tech.id) && where.skills.hasEvery.every((skill) => tech.skills.includes(skill)) &&
+          tech.rating >= (where.rating?.gte ?? 0) && tech.ratingCount >= (where.ratingCount?.gte ?? 0),
+        ),
+      ),
+      findFirst: jest.fn(async ({ where }: { where: { id: string; userId: string; skills: { hasEvery: string[] } } }) =>
+        technicians.find((tech) =>
+          tech.id === where.id && tech.userId === where.userId && where.skills.hasEvery.every((skill) => tech.skills.includes(skill)),
+        ) ?? null,
+      ),
       findUnique: jest.fn(async ({ where }: { where: { userId: string } }) =>
-        [techA, techB].find((t) => t.userId === where.userId) ?? null,
+        technicians.find((tech) => tech.userId === where.userId) ?? null,
       ),
     },
     dispatchOffer: {
-      findUnique: jest.fn(async ({ where, include }: { where?: { id: string }; include?: Record<string, boolean> } = {}) => {
-        const offer = offers.find((o) => o['id'] === where?.id);
+      findUnique: jest.fn(async ({ where }: { where: { id: string } }) => {
+        const offer = offers.find((candidate) => candidate.id === where.id);
         if (!offer) return null;
-        const result: Record<string, unknown> = { ...offer };
-        if (include?.['technician']) {
-          result['technician'] = [techA, techB].find((t) => t.id === offer['technicianId']);
-        }
-        if (include?.['order']) {
-          result['order'] = { id: 'o1', orderNumber: 'HM-2026-000001', customerId: 'c1', state: orderState.state };
-        }
-        return result;
+        return {
+          ...offer,
+          technician: technicians.find((tech) => tech.id === offer.technicianId),
+          order: { ...order, state: orderState },
+        };
       }),
-      findMany: jest.fn(async ({ where }: { where?: { status?: string; technicianId?: { not?: string } } } = {}) =>
-        offers.filter((offer) => {
-          if (where?.status && offer['status'] !== where.status) return false;
-          if (where?.technicianId?.not && offer['technicianId'] === where.technicianId.not) return false;
-          return true;
-        }) as Array<Record<string, unknown>> & { length: number },
+      findFirst: jest.fn(async ({ where }: { where: OfferFilter }) =>
+        findOffers(where).sort((a, b) => b.wave - a.wave)[0] ?? null,
       ),
-      create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => {
-        const row = { id: `offer-${++offerSeq}`, respondedAt: null, ...data };
+      findMany: jest.fn(async ({ where }: { where: OfferFilter }) => findOffers(where).map((offer) => ({
+        ...offer,
+        technician: technicians.find((tech) => tech.id === offer.technicianId),
+      }))),
+      create: jest.fn(async ({ data }: { data: Omit<OfferRow, 'id' | 'status' | 'respondedAt' | 'attempt' | 'isBranchInvite'> }) => {
+        const row: OfferRow = {
+          ...data, id: `offer-${++offerSeq}`, attempt: 1, status: 'PENDING', respondedAt: null, isBranchInvite: false,
+        };
         offers.push(row);
         return { ...row };
       }),
-      update: jest.fn(async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
-        const offer = offers.find((o) => o['id'] === where.id);
-        if (offer) Object.assign(offer, data);
-        return { ...offer };
+      updateMany: jest.fn(async ({ where, data }: { where: OfferFilter; data: Partial<OfferRow> }) => {
+        const matches = findOffers(where);
+        for (const offer of matches) Object.assign(offer, data);
+        return { count: matches.length };
       }),
-      updateMany: jest.fn(async ({ where, data }: { where: { orderId?: string; status?: string; technicianId?: { not?: string } }; data: Record<string, unknown> }) => {
-        let count = 0;
-        for (const offer of offers) {
-          if (where.orderId && offer['orderId'] !== where.orderId) continue;
-          if (where.status && offer['status'] !== where.status) continue;
-          if (where.technicianId?.not && offer['technicianId'] === where.technicianId.not) continue;
-          Object.assign(offer, data);
-          count += 1;
-        }
-        return { count };
-      }),
-      count: jest.fn(async ({ where }: { where?: { status?: string; orderId?: string } } = {}) =>
-        offers.filter((offer) => {
-          if (where?.status && offer['status'] !== where.status) return false;
-          if (where?.orderId && offer['orderId'] !== where.orderId) return false;
-          return true;
-        }).length,
-      ),
+      count: jest.fn(async ({ where }: { where: OfferFilter }) => findOffers(where).length),
     },
     orderStateTransition: { create: jest.fn().mockResolvedValue({}) },
-    branch: { findUnique: jest.fn().mockResolvedValue({ id: 'b1', admin: { id: 'a1' } }) },
+    $queryRaw: jest.fn(async () => [{ state: orderState }]),
     $transaction: jest.fn(async (fn: (tx: unknown) => unknown) => fn(prisma)),
   } as unknown as PrismaService;
 
@@ -136,7 +173,7 @@ function buildDispatch(options?: { lockAcquired?: boolean }) {
   const notificationsService = { send: jest.fn().mockResolvedValue({}) } as unknown as NotificationsService;
 
   const service = new DispatchService(prisma, redis as unknown as RedisService, realtimeService, notificationsService);
-  const sweeper = new DispatchSweeperService(prisma, service);
+  const sweeper = new DispatchSweeperService(prisma, service, { nodeEnv: 'test' } as AppConfigService);
   return {
     service,
     sweeper,
@@ -145,35 +182,40 @@ function buildDispatch(options?: { lockAcquired?: boolean }) {
     realtimeService,
     notificationsService,
     offers,
-    getOrderState: () => orderState.state,
-    seedOffer: (technicianId: string, userId: string) => {
-      offers.push({
+    getOrderState: () => orderState,
+    seedOffer: (technicianId: string, expiresAt = new Date(Date.now() + 30_000)) => {
+      const offer: OfferRow = {
         id: `offer-${technicianId}`,
         orderId: 'o1',
         technicianId,
         status: 'PENDING',
         radiusMeters: 5000,
-        expiresAt: new Date(Date.now() + 30_000),
+        expiresAt,
         respondedAt: null,
-        technician: { userId },
         score: 90,
-      });
+        wave: 1,
+        audience: 'ALL',
+        attempt: 1,
+        isBranchInvite: false,
+      };
+      offers.push(offer);
+      return offer;
     },
   };
 }
 
 describe('DispatchService — atomic single-winner accept (Invariant 5)', () => {
   it('two technicians accepting the same order → exactly ONE wins; loser offer CANCELLED + OFFER_TAKEN emitted', async () => {
-    const { service, prisma, realtimeService, offers, seedOffer } = buildDispatch();
-    seedOffer('tp-a', 't1');
-    seedOffer('tp-b', 't2');
+    const { service, prisma, realtimeService, seedOffer } = buildDispatch();
+    const firstOffer = seedOffer('tp-a');
+    const secondOffer = seedOffer('tp-b');
 
     const winner = await service.acceptOffer(actorT1, 'offer-tp-a');
     expect(winner.state).toBe('EXPERT_ASSIGNED');
 
     // Winner offer accepted, loser cancelled via updateMany.
-    expect(offers.find((o) => o['id'] === 'offer-tp-a')?.['status']).toBe('ACCEPTED');
-    expect(offers.find((o) => o['id'] === 'offer-tp-b')?.['status']).toBe('CANCELLED');
+    expect(firstOffer.status).toBe('ACCEPTED');
+    expect(secondOffer.status).toBe('CANCELLED');
     expect(realtimeService.emitToUser).toHaveBeenCalledWith(
       't2',
       'OFFER_TAKEN',
@@ -189,13 +231,13 @@ describe('DispatchService — atomic single-winner accept (Invariant 5)', () => 
 
     // Second (now-cancelled) offer → 409, never a double win.
     await expect(service.acceptOffer(actorT2, 'offer-tp-b')).rejects.toThrow(ConflictException);
-    expect(offers.find((o) => o['id'] === 'offer-tp-b')?.['status']).toBe('CANCELLED');
+    expect(secondOffer.status).toBe('CANCELLED');
   });
 
-  it('a lost lock race → 409 Persian conflict, state untouched, lock released in finally', async () => {
+  it('rejects a lost lock race without changing the order state', async () => {
     const { service, redis, seedOffer, getOrderState } = buildDispatch({ lockAcquired: false });
-    seedOffer('tp-a', 't1');
-    await expect(service.acceptOffer(actorT1, 'offer-tp-a')).rejects.toThrow(/لحظاتی پیش/);
+    seedOffer('tp-a');
+    await expect(service.acceptOffer(actorT1, 'offer-tp-a')).rejects.toThrow(ConflictException);
     expect(getOrderState()).toBe('SEARCHING_EXPERT');
     // Lock release is NOT called when acquisition failed (nothing to release).
     expect(redis.releaseOrderLock).not.toHaveBeenCalled();
@@ -203,19 +245,81 @@ describe('DispatchService — atomic single-winner accept (Invariant 5)', () => 
 
   it('lock is ALWAYS released after a successful accept (finally)', async () => {
     const { service, redis, seedOffer } = buildDispatch();
-    seedOffer('tp-a', 't1');
+    seedOffer('tp-a');
     await service.acceptOffer(actorT1, 'offer-tp-a');
     expect(redis.releaseOrderLock).toHaveBeenCalledWith('o1', 'tok-1');
   });
 
-  it('an expired offer is marked EXPIRED and rejected', async () => {
-    const { service, offers, seedOffer } = buildDispatch();
-    seedOffer('tp-a', 't1');
-    const offer = offers.find((o) => o['id'] === 'offer-tp-a') as Record<string, unknown>;
-    offer['expiresAt'] = new Date(Date.now() - 1000);
+  it('rejects acceptance of an expired offer before acquiring a lock', async () => {
+    const { service, redis, seedOffer } = buildDispatch();
+    const offer = seedOffer('tp-a', new Date(Date.now() - 1000));
+    await expect(service.acceptOffer(actorT1, offer.id)).rejects.toThrow(BadRequestException);
+    expect(redis.acquireOrderLock).not.toHaveBeenCalled();
+  });
+});
 
-    await expect(service.acceptOffer(actorT1, 'offer-tp-a')).rejects.toThrow(/مهلت/);
-    expect(offer['status']).toBe('EXPIRED');
+describe('Phase 11B funded offer priority', () => {
+  it('opens only TOP at +5%, then reopens the same ring after expiry', async () => {
+    const { service, sweeper, offers } = buildDispatch({ sliderBps: 500 });
+    const startedAt = Date.now();
+    await expect(service.startSearch('o1')).resolves.toEqual({ offersCreated: 1, radiusMeters: 5000 });
+    expect(offers).toEqual([expect.objectContaining({ wave: 1, audience: 'TOP', technicianId: techA.id })]);
+    const [first] = offers;
+    if (!first) throw new Error('TOP offer missing');
+    expect(first.expiresAt.getTime()).toBeGreaterThanOrEqual(startedAt + 30_000);
+    first.expiresAt = new Date(startedAt - 1);
+    await expect(sweeper.expireStaleOffers()).resolves.toMatchObject({ expired: 1, reWavedOrders: 1 });
+    expect(offers).toEqual([
+      expect.objectContaining({ wave: 1, audience: 'TOP', status: 'EXPIRED', technicianId: techA.id, radiusMeters: 5000 }),
+      expect.objectContaining({ wave: 2, audience: 'ALL', status: 'PENDING', technicianId: techB.id, radiusMeters: 5000 }),
+    ]);
+  });
+
+  it('reopens after the last TOP decline', async () => {
+    const { service, offers, redis, getOrderState } = buildDispatch({ sliderBps: 2500 });
+    await service.startSearch('o1');
+    const [first] = offers;
+    if (!first) throw new Error('TOP offer missing');
+    await expect(service.declineOffer(actorT1, first.id)).resolves.toMatchObject({ status: 'DECLINED' });
+    const rookie = offers[1];
+    expect(rookie).toMatchObject({ wave: 2, audience: 'ALL', technicianId: techB.id, radiusMeters: 5000 });
+    if (!rookie) throw new Error('ALL offer missing');
+    await expect(service.declineOffer(actorT2, rookie.id)).resolves.toMatchObject({ status: 'DECLINED' });
+    expect(redis.findNearbyTechs.mock.calls.map((call) => call[3])).toEqual([5000, 5000, 12000, 19000]);
+    expect(getOrderState()).toBe('BRANCH_QUEUE');
+  });
+
+  it('skips straight to ALL in the initial ring when the configured top ratings exclude everyone', async () => {
+    const { service, prisma, offers } = buildDispatch({ sliderBps: 500 });
+    (prisma.platformConfig.findUnique as jest.Mock).mockResolvedValue({ value: { topMinRating: 5 } });
+    await expect(service.startSearch('o1')).resolves.toEqual({ offersCreated: 2, radiusMeters: 5000 });
+    expect(offers.every((offer) => offer.wave === 2 && offer.audience === 'ALL')).toBe(true);
+    expect(offers.map((offer) => offer.technicianId)).toContain(techB.id);
+  });
+
+  it.each([-1500, 0, 400])('opens ALL at %d bps and lets the rookie win the atomic acceptance race', async (sliderBps) => {
+    const { service, redis, offers, getOrderState } = buildDispatch({ sliderBps });
+    await expect(service.startSearch('o1')).resolves.toEqual({ offersCreated: 2, radiusMeters: 5000 });
+    expect(offers.every((offer) => offer.wave === 1 && offer.audience === 'ALL')).toBe(true);
+    const rookie = offers.find((offer) => offer.technicianId === techB.id);
+    const veteran = offers.find((offer) => offer.technicianId === techA.id);
+    if (!rookie || !veteran) throw new Error('Expected one offer per technician');
+    const [first, second] = await Promise.allSettled([
+      service.acceptOffer(actorT2, rookie.id), service.acceptOffer(actorT1, veteran.id),
+    ]);
+    expect(first).toMatchObject({ status: 'fulfilled', value: { offerId: rookie.id } });
+    expect(second).toMatchObject({ status: 'rejected', reason: expect.any(ConflictException) });
+    expect(rookie.status).toBe('ACCEPTED');
+    expect(veteran.status).toBe('CANCELLED');
+    expect(redis.acquireOrderLock).toHaveBeenCalledTimes(2);
+    expect(redis.releaseOrderLock).toHaveBeenCalledTimes(1);
+    expect(getOrderState()).toBe('EXPERT_ASSIGNED');
+  });
+
+  it('requires an active FUNDED revision for priority', async () => {
+    const { service, offers } = buildDispatch({ sliderBps: 2500, revisionStatus: 'DRAFT' });
+    await expect(service.startSearch('o1')).resolves.toMatchObject({ offersCreated: 2 });
+    expect(offers.every((offer) => offer.audience === 'ALL')).toBe(true);
   });
 });
 
@@ -259,18 +363,15 @@ describe('DispatchService — expanding radius & BRANCH_QUEUE fallback', () => {
 
 describe('DispatchSweeperService — expiry sweeper', () => {
   it('expires stale PENDING offers and re-waves affected SEARCHING_EXPERT orders', async () => {
-    const { service, sweeper, prisma, offers, seedOffer } = buildDispatch();
-    seedOffer('tp-a', 't1');
-    const staleOffer = offers[0] as Record<string, unknown>;
-    staleOffer['expiresAt'] = new Date(Date.now() - 1000);
-    void service;
+    const { sweeper, prisma, seedOffer } = buildDispatch();
+    const staleOffer = seedOffer('tp-a', new Date(Date.now() - 1000));
 
     const result = await sweeper.expireStaleOffers();
-    expect(result.expired).toBe(1);
-    expect(staleOffer['status']).toBe('EXPIRED');
-    expect(prisma.serviceOrder.findUnique).toHaveBeenCalled();
-    // startSearch is invoked through the sweeper for the affected order.
-    expect(prisma.dispatchOffer.create).toHaveBeenCalled();
+    expect(result).toEqual({ expired: 1, reWavedOrders: 1 });
+    expect(staleOffer.status).toBe('EXPIRED');
+    expect(prisma.dispatchOffer.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ technicianId: techB.id, wave: 2, radiusMeters: 12000 }),
+    });
   });
 });
 

@@ -1,5 +1,5 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
-import { UserRole } from '@prisma/client';
+import { UserRole, type Prisma } from '@prisma/client';
 import type { AuthenticatedUser } from '@common/types/authenticated-user';
 import type { PrismaService } from '@infra/prisma/prisma.service';
 import type { RealtimeService } from '@infra/realtime/realtime.service';
@@ -79,9 +79,12 @@ function buildService(options?: {
         Object.assign(orderRow, data);
         return { ...orderRow };
       }),
-      updateMany: jest.fn(async ({ where, data }: { where: { id: string; state: string }; data: Record<string, unknown> }) => {
-        if (orderRow.id !== where.id || orderRow.state !== where.state) return { count: 0 };
-        Object.assign(orderRow, data);
+      updateMany: jest.fn(async ({ where, data }: Prisma.ServiceOrderUpdateManyArgs) => {
+        if (!where || orderRow.id !== where.id || orderRow.state !== where.state) return { count: 0 };
+        const { handoverAttempts, ...changes } = data;
+        Object.assign(orderRow, changes);
+        if (typeof handoverAttempts === 'number') orderRow.handoverAttempts = handoverAttempts;
+        else if (typeof handoverAttempts?.increment === 'number') orderRow.handoverAttempts += handoverAttempts.increment;
         return { count: 1 };
       }),
     },
@@ -291,15 +294,18 @@ describe('WarrantyService — complete handover (atomic warranty + escrow)', () 
       }),
       expect.anything(),
     );
-    // Digital warranty with per-item coverage (min warrantyMonths = 12).
-    expect(result.warranty.policyNumber).toMatch(/^WR-\d{4}-\d{6}$/);
-    expect(result.warranty.coverageMonths).toBe(12);
-    expect(result.warranty.warrantyReserveAmount).toBe(50_000n);
-    expect(result.warranty.status).toBe('ACTIVE');
+    expect(result).toEqual({
+      orderId: 'o1', state: 'COMPLETED_WARRANTY_ACTIVE',
+      warrantyPolicyNumber: expect.stringMatching(/^WR-\d{4}-\d{6}$/),
+      coverageMonths: 12, guaranteedNetPayout: 850_000n,
+    });
     expect(warranties).toHaveLength(1);
+    expect(warranties[0]).toMatchObject({ policyNumber: result.warrantyPolicyNumber,
+      coverageMonths: 12, status: 'ACTIVE', warrantyReserveAmount: 50_000n });
     // Optimistic terminal transition + audit metadata.
     expect(prisma.serviceOrder.updateMany).toHaveBeenCalledWith({
-      where: { id: 'o1', state: 'HANDOVER_OTP_PENDING' },
+      where: { id: 'o1', state: 'HANDOVER_OTP_PENDING', technicianId: 't1', handoverOtpHash: expect.any(String),
+        handoverAttempts: { lt: 3 }, handoverOtpExpiresAt: { gt: expect.any(Date) } },
       data: expect.objectContaining({ state: 'COMPLETED_WARRANTY_ACTIVE', completedAt: expect.any(Date) }),
     });
     expect(prisma.orderStateTransition.create).toHaveBeenCalledWith({
