@@ -33,7 +33,7 @@ services:
     profiles: ['fullstack']
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: apps/api/Dockerfile
     container_name: homental-api
     depends_on:
       postgres:
@@ -45,7 +45,7 @@ services:
       PORT: 3000
       DATABASE_URL: postgresql://homental:homental_dev@postgres:5432/homental
       REDIS_URL: redis://redis:6379
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3001}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3001,http://localhost:3002}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-homental-docker-access-secret-change-me-32chars}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-homental-docker-refresh-secret-change-me-32chars}
       JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
@@ -68,20 +68,37 @@ services:
       start_period: 25s
       retries: 5
 
-  web:
+  customer:
     profiles: ['fullstack']
     build:
-      context: ./web
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: apps/customer/Dockerfile
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3000/api/v1}
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-http://localhost:3000}
-    container_name: homental-web
+        NEXT_PUBLIC_PARTNERS_URL: ${NEXT_PUBLIC_PARTNERS_URL:-http://localhost:3002}
+    container_name: homental-customer
     depends_on:
       api:
         condition: service_healthy
     ports:
       - '3001:3001'
+
+  partners:
+    profiles: ['fullstack']
+    build:
+      context: .
+      dockerfile: apps/partners/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3000/api/v1}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-http://localhost:3000}
+        NEXT_PUBLIC_CUSTOMER_URL: ${NEXT_PUBLIC_CUSTOMER_URL:-http://localhost:3001}
+    container_name: homental-partners
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - '3002:3002'
 
 volumes:
   homental_pgdata:

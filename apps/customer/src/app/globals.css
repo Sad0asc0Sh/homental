@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body,
+a,
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  @apply bg-slate-50 text-slate-800 antialiased;
+  font-feature-settings: 'ss01';
+  overscroll-behavior-y: contain;
+}
+
+/* Persian-friendly number rendering */
+.tabular-fa {
+  font-variant-numeric: tabular-nums;
+}
+
+.safe-pt {
+  padding-top: env(safe-area-inset-top);
+}
+
+.safe-pb {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.safe-bottom-nav-offset {
+  padding-bottom: calc(4.75rem + env(safe-area-inset-bottom));
+}
+
+.card {
+  @apply rounded-2xl bg-white p-5 shadow-card ring-1 ring-slate-100;
+}
+
+.chip {
+  @apply inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-sm transition-colors;
+}
+
+.btn-primary {
+  @apply inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-primary-900 px-5 py-3 font-bold text-white transition-colors hover:bg-primary-700 disabled:cursor-not-allowed disabled:opacity-60;
+}
+
+.btn-ghost {
+  @apply inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-bold text-slate-700 transition-colors hover:border-primary-300 hover:text-primary-700;
+}

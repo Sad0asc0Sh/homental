@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="هومنتال همکاران">
+  <rect width="512" height="512" rx="0" fill="#064e3b" />
+  <g transform="translate(51.2, 51.2) scale(0.8)">
+    <path d="M256 72 L408 136 V268 C408 352 340 416 256 446 C172 416 104 352 104 268 V136 Z" fill="#f59e0b" fill-opacity="0.16" stroke="#f59e0b" stroke-width="24" stroke-linejoin="round" />
+    <path d="M192 260 L238 308 L322 210" fill="none" stroke="#ffffff" stroke-width="26" stroke-linecap="round" stroke-linejoin="round" />
+  </g>
+</svg>
